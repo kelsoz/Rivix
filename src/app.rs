@@ -212,7 +212,7 @@ fn sync_native_menu_theme(dark: bool) {
 }
 
 /// 项目仓库地址（关于页展示、打开与复制共用）。
-const REPO_URL: &str = "https://github.com/launcher-rs/rivix";
+const REPO_URL: &str = "https://github.com/kelsoz/Rivix";
 
 /// 当前程序版本号（编译期取自 `Cargo.toml`，关于页展示用）。
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1742,7 +1742,7 @@ fn setting_switch_row(
 fn fetch_latest_github_release() -> Result<(String, String), String> {
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-sS", "-m", "10", "-H", "User-Agent: rivix"])
-        .arg("https://api.github.com/repos/launcher-rs/rivix/releases/latest")
+        .arg("https://api.github.com/repos/kelsoz/Rivix/releases/latest")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
