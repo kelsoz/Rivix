@@ -214,6 +214,20 @@ fn load_extra(lang: &Lang) -> HashMap<String, String> {
 fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
     let zh = matches!(lang, Lang::Zh);
     Some(match key {
+        "qr.opened" => {
+            if zh {
+                "二维码地址已复制，已请求浏览器打开"
+            } else {
+                "QR address copied; browser requested"
+            }
+        }
+        "qr.copied" => {
+            if zh {
+                "二维码内容已复制"
+            } else {
+                "QR content copied"
+            }
+        }
         // —— 设置页 Tab ——
         "tab.capture" => {
             if zh {
@@ -238,9 +252,9 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         }
         "tab.ocr" => {
             if zh {
-                "OCR 模型"
+                "文字识别"
             } else {
-                "OCR Models"
+                "Text recognition"
             }
         }
         "tab.general" => {
@@ -260,9 +274,9 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         // —— 设置窗口 ——
         "app.title" => {
             if zh {
-                "Rupix · 拾景 设置"
+                "Rivix · 望川 设置"
             } else {
-                "Rupix Settings"
+                "Rivix Settings"
             }
         }
         "app.subtitle" => {
@@ -305,6 +319,13 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
                 "{label}全局截图快捷键：{text}"
             } else {
                 "{label} global hotkey: {text}"
+            }
+        }
+        "hotkey.disabled" => {
+            if zh {
+                "未设置全局快捷键"
+            } else {
+                "No global shortcut"
             }
         }
         "hotkey.cleared" => {
@@ -352,9 +373,9 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         // —— 保存目录卡 ——
         "savedir.title" => {
             if zh {
-                "默认保存路径（截图自动保存原图到此）"
+                "手动保存的默认路径"
             } else {
-                "Default save path (captures auto-save here)"
+                "Default folder for manual saves"
             }
         }
         "savedir.pick" => {
@@ -481,9 +502,9 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         // —— 关于 Tab ——
         "about.title" => {
             if zh {
-                "关于 Rupix · 拾景"
+                "关于 Rivix · 望川"
             } else {
-                "About Rupix"
+                "About Rivix"
             }
         }
         "about.version" => {
@@ -750,9 +771,9 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         }
         "app.tips" => {
             if zh {
-                "区域截图：在全屏遮罩上拖拽框选（悬停窗口高亮时点击直接截该窗口），松手后进独立预览窗口（可缩放/复制/保存，可底部状态栏查看结果），右键/Esc 取消。取色：在冻结帧上移动取色，点击复制 HEX。本窗口关闭即隐藏到托盘。"
+                "拖框时按住空格移动选区，按 T 识别并复制文字，按 C 复制鼠标处 HEX 并结束，按 S 保存选区，按 P 贴图；直接松手复制截图。Esc 取消，图片按需手动保存。"
             } else {
-                "Region capture: drag on the fullscreen mask (click a highlighted window to capture it), then annotate in the preview window (zoom/copy/save, results in its status bar), right-click/Esc cancels. Picker: move on the frozen frame, click copies HEX. Closing this window hides to tray."
+                "Hold Space while dragging to move the region. Press T to copy text, C to copy the cursor HEX and finish, S to save the region, P to pin, or release to copy the screenshot. Esc cancels. Save images manually."
             }
         }
         "app.status" => {
@@ -776,19 +797,75 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
                 "Ready: region {region} | fullscreen {full} | picker {picker}"
             }
         }
+        "app.slogan" => {
+            if zh {
+                "简洁,却不简单"
+            } else {
+                "Simple, yet powerful"
+            }
+        }
+        "tab.record" => {
+            if zh {
+                "录屏设置"
+            } else {
+                "Recording"
+            }
+        }
+        "update.check" => {
+            if zh {
+                "检查更新"
+            } else {
+                "Check Updates"
+            }
+        }
+        "update.checking" => {
+            if zh {
+                "正在检查更新…"
+            } else {
+                "Checking for updates…"
+            }
+        }
+        "update.latest" => {
+            if zh {
+                "已是最新版本 v{ver}"
+            } else {
+                "Up to date (v{ver})"
+            }
+        }
+        "update.found" => {
+            if zh {
+                "发现新版本 {tag}（点击打开下载）"
+            } else {
+                "Update available: {tag} (click)"
+            }
+        }
+        "update.fail" => {
+            if zh {
+                "检查更新失败，请确认网络或仓库已发布"
+            } else {
+                "Update check failed"
+            }
+        }
         "app.window_title" => {
             if zh {
-                "Rupix 设置"
+                "Rivix 设置"
             } else {
-                "Rupix Settings"
+                "Rivix Settings"
             }
         }
         // —— 托盘 ——
         "tray.tooltip" => {
             if zh {
-                "Rupix 拾景"
+                "Rivix 望川"
             } else {
-                "Rupix"
+                "Rivix"
+            }
+        }
+        "tray.recording_tooltip" => {
+            if zh {
+                "录屏进行中，双击结束"
+            } else {
+                "Recording in progress, double-click to stop"
             }
         }
         "tray.region" => {
@@ -833,6 +910,118 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
                 "Settings"
             }
         }
+        "tray.dark_mode" => {
+            if zh {
+                "深色模式"
+            } else {
+                "Dark mode"
+            }
+        }
+        "tray.stop_record" => {
+            if zh {
+                "停止录屏"
+            } else {
+                "Stop recording"
+            }
+        }
+        "rec.start" => {
+            if zh {
+                "开始录屏"
+            } else {
+                "Start"
+            }
+        }
+        "rec.pause" => {
+            if zh {
+                "暂停"
+            } else {
+                "Pause"
+            }
+        }
+        "rec.resume" => {
+            if zh {
+                "继续"
+            } else {
+                "Resume"
+            }
+        }
+        "rec.stop" => {
+            if zh {
+                "停止"
+            } else {
+                "Stop"
+            }
+        }
+        "rec.cancel" => {
+            if zh {
+                "取消"
+            } else {
+                "Cancel"
+            }
+        }
+        "rec.ratio_free" => {
+            if zh {
+                "自由"
+            } else {
+                "Free"
+            }
+        }
+        "rec.fullscreen" => {
+            if zh {
+                "全屏"
+            } else {
+                "Full"
+            }
+        }
+        "rec.sys_audio" => {
+            if zh {
+                "系统声"
+            } else {
+                "System"
+            }
+        }
+        "rec.mic_audio" => {
+            if zh {
+                "麦克风"
+            } else {
+                "Mic"
+            }
+        }
+        "rec.cursor" => {
+            if zh {
+                "鼠标"
+            } else {
+                "Cursor"
+            }
+        }
+        "rec.saving" => {
+            if zh {
+                "正在封装录屏…"
+            } else {
+                "Finalizing recording…"
+            }
+        }
+        "rec.saved" => {
+            if zh {
+                "录屏已保存到下载文件夹"
+            } else {
+                "Recording saved to Downloads"
+            }
+        }
+        "rec.failed" => {
+            if zh {
+                "录屏失败：{msg}"
+            } else {
+                "Recording failed: {msg}"
+            }
+        }
+        "rec.unsupported" => {
+            if zh {
+                "当前平台暂不支持录屏"
+            } else {
+                "Recording is not supported on this platform"
+            }
+        }
         "tray.quit" => {
             if zh {
                 "退出"
@@ -871,7 +1060,7 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         }
         "behavior.open_editor.note" => {
             if zh {
-                "关闭后截完只在右下角闪一下；要补标注用「编辑最近一张」"
+                "关闭后仅显示底部提示；需要标注或保存时，打开“编辑最近一张”"
             } else {
                 "When off, a short toast reports the result; annotate later via the tray menu"
             }
@@ -1018,11 +1207,116 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
             }
         }
         // —— 浮层 ——
+        "mini.coordinates" => {
+            if zh {
+                "坐标"
+            } else {
+                "Point"
+            }
+        }
+        "mini.selection" => {
+            if zh {
+                "选区"
+            } else {
+                "Region"
+            }
+        }
+        "shot.saved_file" => {
+            if zh {
+                "已保存：{path}"
+            } else {
+                "Saved: {path}"
+            }
+        }
+        "pin.title" => {
+            if zh {
+                "Rivix 贴图"
+            } else {
+                "Rivix Pin"
+            }
+        }
+        "pin.last" => {
+            if zh {
+                "贴出最近截图"
+            } else {
+                "Pin latest screenshot"
+            }
+        }
+        "pin.copy" => {
+            if zh {
+                "复制图片"
+            } else {
+                "Copy image"
+            }
+        }
+        "pin.reset" => {
+            if zh {
+                "恢复原尺寸"
+            } else {
+                "Actual size"
+            }
+        }
+        "pin.close" => {
+            if zh {
+                "关闭"
+            } else {
+                "Close"
+            }
+        }
+        "pin.close_all" => {
+            if zh {
+                "关闭全部贴图"
+            } else {
+                "Close all pins"
+            }
+        }
+        "pin.failed" => {
+            if zh {
+                "贴图失败：{error}"
+            } else {
+                "Pin failed: {error}"
+            }
+        }
+        "pin.copy_failed" => {
+            if zh {
+                "图片编码失败"
+            } else {
+                "Image encoding failed"
+            }
+        }
+        "pin.empty" => {
+            if zh {
+                "图片为空"
+            } else {
+                "Empty image"
+            }
+        }
+        "mini.save" => {
+            if zh {
+                "保存"
+            } else {
+                "Save"
+            }
+        }
+        "mini.pick" => {
+            if zh {
+                "取色"
+            } else {
+                "Color"
+            }
+        }
+        "mini.ocr" => {
+            if zh {
+                "识字"
+            } else {
+                "OCR"
+            }
+        }
         "overlay.hint" => {
             if zh {
-                "拖拽选区 / 点击窗口截取；右键 / Esc 取消"
+                "拖拽选区 · 按住空格移动 · T 识别复制 · Esc 取消"
             } else {
-                "Drag to select / click window to capture; right-click / Esc cancels"
+                "Drag to capture; hold Space to move; T copies text; Esc cancels"
             }
         }
         "overlay.badge_click" => {
@@ -1064,9 +1358,9 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         // —— 预览窗口标题 ——
         "viewer.title" => {
             if zh {
-                "Rupix 预览（{w} × {h}）"
+                "Rivix 预览（{w} × {h}）"
             } else {
-                "Rupix Preview ({w} × {h})"
+                "Rivix Preview ({w} × {h})"
             }
         }
         // —— 预览操作排 ——
@@ -1175,11 +1469,46 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
                 "No text found"
             }
         }
+        "shot.copied" => {
+            if zh {
+                "截图已复制到剪贴板"
+            } else {
+                "Screenshot copied to clipboard"
+            }
+        }
+        "shot.not_saved" => {
+            if zh {
+                "截图完成，尚未保存"
+            } else {
+                "Screenshot captured, not saved"
+            }
+        }
+        "shot.copy_failed" => {
+            if zh {
+                "复制失败：{error}，可从编辑最近一张手动保存"
+            } else {
+                "Copy failed: {error}. Save from Edit last capture."
+            }
+        }
+        "ocr.text_copied" => {
+            if zh {
+                "文字已复制到剪贴板"
+            } else {
+                "Text copied to clipboard"
+            }
+        }
+        "ocr.local_ready" => {
+            if zh {
+                "CUDA OCR 文件已就绪，首次识别时加载并核验 GPU；空闲三分钟后释放。"
+            } else {
+                "CUDA OCR files found. GPU verified on first use; released after 3 minutes idle."
+            }
+        }
         "viewer.ocr_no_models" => {
             if zh {
-                "未找到 OCR 模型，请在设置 → OCR 模型中指定三个模型文件"
+                "RapidOCR CUDA 依赖缺失，请检查独立 OCR 项目的 GPU 环境、接口及 DLL 目录"
             } else {
-                "OCR models missing, specify the three files in Settings → OCR Models"
+                "RapidOCR CUDA dependencies missing. Check the GPU environment, worker and DLL directory."
             }
         }
         "viewer.ocr_fail" => {
@@ -1247,29 +1576,71 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         }
         "viewer.op_hint" => {
             if zh {
-                "V/1-8切换 · 空格平移 · Ctrl+滚轮缩放 · Esc关闭"
+                "空格移动草稿 · 滚轮缩放 · Ctrl+T变换 · Ctrl+S保存 · 关闭复制"
             } else {
-                "V/1-8 tools · Space pan · Ctrl+wheel zoom · Esc closes"
+                "Space moves draft · Wheel zoom · Ctrl+T transform · Ctrl+S save · Close copies"
             }
         }
         // —— 预览标注排 ——
+        "viewer.transform_hint" => {
+            if zh {
+                "拖动框体移动 · 控制点缩放 · Shift 等比 · Enter 确认 · Esc 取消"
+            } else {
+                "Drag to move · Handles resize · Shift proportional · Enter apply · Esc cancel"
+            }
+        }
+        "viewer.transform_empty" => {
+            if zh {
+                "先绘制或选择一条标注，再按 Ctrl+T"
+            } else {
+                "Draw or select an annotation before Ctrl+T"
+            }
+        }
+        "viewer.editor_title" => {
+            if zh {
+                "截图标注"
+            } else {
+                "Screenshot editor"
+            }
+        }
+        "viewer.sampled" => {
+            if zh {
+                "绘制颜色已设为"
+            } else {
+                "Drawing color:"
+            }
+        }
+        "tool.line" => {
+            if zh {
+                "直线 L"
+            } else {
+                "Line L"
+            }
+        }
+        "tool.eyedropper" => {
+            if zh {
+                "吸管 I"
+            } else {
+                "Pick I"
+            }
+        }
         "tool.select" => {
             if zh {
-                "选择"
+                "选择 V"
             } else {
                 "Select"
             }
         }
         "tool.rect" => {
             if zh {
-                "矩形"
+                "矩形 R"
             } else {
                 "Rect"
             }
         }
         "tool.ellipse" => {
             if zh {
-                "椭圆"
+                "圆 O"
             } else {
                 "Ellipse"
             }
@@ -1283,7 +1654,7 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         }
         "tool.pen" => {
             if zh {
-                "画笔"
+                "画笔 B"
             } else {
                 "Pen"
             }
@@ -1297,23 +1668,23 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         }
         "tool.eraser" => {
             if zh {
-                "橡皮擦"
+                "橡皮擦 E"
             } else {
                 "Eraser"
             }
         }
         "tool.mosaic" => {
             if zh {
-                "马赛克"
+                "马赛克 M"
             } else {
                 "Mosaic"
             }
         }
         "tool.text" => {
             if zh {
-                "文字"
+                "文字 T"
             } else {
-                "Text"
+                "Text T"
             }
         }
         "tool.picker" => {
@@ -1332,9 +1703,9 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
         }
         "viewer.text_confirm" => {
             if zh {
-                "回车确认 · Esc 取消"
+                "回车 / Esc 确认"
             } else {
-                "Enter confirms · Esc cancels"
+                "Enter / Esc confirms"
             }
         }
         "viewer.text_new" => {
@@ -1619,8 +1990,8 @@ mod tests {
     /// 占位符按名替换，未知 key 保底返回 key 本身。
     #[test]
     fn tr_fmt_replaces_args() {
-        let text = tr_fmt("viewer.saved", &[("name", "a.png"), ("loc", "rupix")]);
-        assert!(text.contains("a.png") && text.contains("rupix"));
+        let text = tr_fmt("viewer.saved", &[("name", "a.png"), ("loc", "rivix")]);
+        assert!(text.contains("a.png") && text.contains("rivix"));
         assert_eq!(tr("no.such.key"), "no.such.key");
     }
 

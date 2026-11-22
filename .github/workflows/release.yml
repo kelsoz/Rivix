@@ -2,7 +2,6 @@
 #   推 `v*` 标签 → 正式版本归档：release 名与 git tag 都是该版本号，不碰 latest，编译档固定 size。
 #   手动 workflow_dispatch → 滚动 `latest`：全平台触发删旧建新，单平台触发只替换该平台附件。
 # 各平台编完即传附件，互不等待；Windows 必过，Linux/macOS 尽力而为。
-# 每平台两个包：常规版（exe + 外置 models/）与内嵌版（--features bundled-ocr-models，开箱即用）。
 name: release
 
 on:
@@ -177,7 +176,6 @@ jobs:
           if [ -d /opt/homebrew/opt/llvm ]; then echo "LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib" >> "$GITHUB_ENV"; fi
           if [ -d /usr/local/opt/llvm ]; then echo "LIBCLANG_PATH=/usr/local/opt/llvm/lib" >> "$GITHUB_ENV"; fi
 
-      # 两次构建产物同名（target/<profile>/rupix），中途改名存下，避免后一次覆盖前一次。
       # 静态 CRT 与 git 拉取配置由仓库 .cargo/config.toml 自带，CI 无需另配。
       - name: 编译（Windows）
         if: runner.os == 'Windows'
@@ -187,8 +185,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path 'pkg' | Out-Null
           cargo build --profile $prof
           Copy-Item -Path "target/$prof/rupix.exe" -Destination 'pkg/rupix-regular.exe'
-          cargo build --profile $prof --features bundled-ocr-models
-          Copy-Item -Path "target/$prof/rupix.exe" -Destination 'pkg/rupix-bundled.exe'
 
       - name: 编译（Linux/macOS）
         if: runner.os != 'Windows'
@@ -198,45 +194,26 @@ jobs:
           mkdir -p pkg
           cargo build --profile "$prof"
           cp "target/$prof/rupix" pkg/rupix-regular
-          cargo build --profile "$prof" --features bundled-ocr-models
-          cp "target/$prof/rupix" pkg/rupix-bundled
 
-      # 常规包：exe + build.rs 已分发到输出目录旁的 models/；内嵌包：单文件即可。
       - name: 打包（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $prof = '${{ needs.prepare.outputs.profile }}'
-          New-Item -ItemType Directory -Force -Path 'dist', 'stage-regular', 'stage-bundled' | Out-Null
+          New-Item -ItemType Directory -Force -Path 'dist', 'stage-regular' | Out-Null
           Copy-Item -Path 'pkg/rupix-regular.exe', 'README.md', 'LICENSE-APACHE' -Destination 'stage-regular/'
           Rename-Item -Path 'stage-regular/rupix-regular.exe' -NewName 'rupix.exe'
-          Copy-Item -Path 'pkg/rupix-bundled.exe', 'README.md', 'LICENSE-APACHE' -Destination 'stage-bundled/'
-          Rename-Item -Path 'stage-bundled/rupix-bundled.exe' -NewName 'rupix.exe'
-          if (Test-Path "target/$prof/models") {
-            Copy-Item -Path "target/$prof/models" -Destination 'stage-regular/models' -Recurse
-          } else {
-            Write-Output '::warning::输出目录旁没有 models（构建脚本未分发），常规包缺 OCR 模型'
-          }
           Compress-Archive -Path 'stage-regular/*' -DestinationPath 'dist/rupix-${{ matrix.name }}.zip'
-          Compress-Archive -Path 'stage-bundled/*' -DestinationPath 'dist/rupix-${{ matrix.name }}-bundled.zip'
 
       - name: 打包（Linux/macOS）
         if: runner.os != 'Windows'
         shell: bash
         run: |
           prof='${{ needs.prepare.outputs.profile }}'
-          mkdir -p dist stage-regular stage-bundled
+          mkdir -p dist stage-regular
           cp pkg/rupix-regular stage-regular/rupix
           cp README.md LICENSE-APACHE stage-regular/
-          cp pkg/rupix-bundled stage-bundled/rupix
-          cp README.md LICENSE-APACHE stage-bundled/
-          if [ -d "target/$prof/models" ]; then
-            cp -r "target/$prof/models" stage-regular/models
-          else
-            echo "::warning::输出目录旁没有 models（构建脚本未分发），常规包缺 OCR 模型"
-          fi
           tar -czf "dist/rupix-${{ matrix.name }}.tar.gz" -C stage-regular .
-          tar -czf "dist/rupix-${{ matrix.name }}-bundled.tar.gz" -C stage-bundled .
 
       # 冒烟（--version/--help 启动检查、cargo test、glibc 基线）已移到 ci.yml：
       # push/PR 都会先跑一遍，发版流程只管编译 + 上传，不再重复等待这些检查。

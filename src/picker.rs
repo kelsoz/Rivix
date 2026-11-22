@@ -4,28 +4,22 @@
 //! 采样坐标严格按“视图逻辑像素 × 缩放比 = 图片物理像素”换算。
 //! 多显示器时每块屏各开一层取色浮层，可在任意屏幕上取色。
 
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{rc::Rc, sync::Arc};
 
 use image::RgbaImage;
 use rgpui::{
-    Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Render, Rgba, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, canvas, div, fill, img, point, prelude::*, px, rgb, rgba, size,
+    Bounds, ClipboardItem, Context, CursorStyle, Div, Entity, FocusHandle, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Render, Rgba, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, fill, img,
+    point, prelude::*, px, rgb, rgba, size,
 };
 
 use crate::{
-    app::RupixApp,
+    app::RivixApp,
     capture::{CapturedFrame, cap_log},
     i18n::{tr, tr_fmt},
     overlay::OverlaySession,
 };
-
-/// 放大镜边长像素数（奇数，保证中心唯一）。
-const MAG_N: i32 = 9;
-/// 放大镜单个图片像素的显示边长（逻辑像素）。
-const MAG_Z: f32 = 14.0;
-/// 放大镜面板总边长（逻辑像素）。
-const MAG_W: f32 = MAG_N as f32 * MAG_Z;
 
 /// 在每块屏上各打开一层取色浮层（多显示器可分别在任意屏幕取色）。
 ///
@@ -38,8 +32,8 @@ const MAG_W: f32 = MAG_N as f32 * MAG_Z;
 /// 至少成功打开一层返回 `true`（之后由取色完成 / 取消复位状态）；
 /// 全部建窗失败返回 `false`，调用方需自行复位「截取中」状态。
 pub fn open_pickers(
-    main: Entity<RupixApp>,
-    cx: &mut Context<RupixApp>,
+    main: Entity<RivixApp>,
+    cx: &mut Context<RivixApp>,
     frames: Vec<CapturedFrame>,
 ) -> bool {
     if frames.is_empty() {
@@ -60,21 +54,16 @@ pub fn open_pickers(
 
 /// 打开单块屏的取色浮层。
 fn open_picker(
-    main: Entity<RupixApp>,
-    cx: &mut Context<RupixApp>,
+    main: Entity<RivixApp>,
+    cx: &mut Context<RivixApp>,
     frame: CapturedFrame,
     index: usize,
     session: Rc<OverlaySession>,
 ) -> bool {
-    // 图片尺寸兜底：捕获时没读到就现场解码一次。
-    let (img_w, img_h) = if frame.img_w > 0 && frame.img_h > 0 {
-        (frame.img_w, frame.img_h)
-    } else {
-        image::image_dimensions(&frame.frame_path).unwrap_or((800, 600))
-    };
+    let (img_w, img_h) = (frame.img_w, frame.img_h);
     let display_bounds = frame.display_bounds;
     let display_id = frame.display_id;
-    let frame_path = frame.frame_path;
+    let pixels = frame.pixels;
     let frame_image = frame.frame_image;
     cap_log(&format!(
         "取色浮层打开：屏 {index} img={img_w}x{img_h} id={display_id:?}"
@@ -113,7 +102,7 @@ fn open_picker(
                     window,
                     cx,
                     main.clone(),
-                    frame_path.clone(),
+                    pixels.clone(),
                     img_w,
                     img_h,
                     display_bounds,
@@ -144,11 +133,12 @@ fn open_picker(
 /// 取色浮层视图：冻结帧 + 十字线 + 放大镜，点击复制。
 struct PickerView {
     /// 设置窗口实体（回写复制状态）。
-    main: Entity<RupixApp>,
+    main: Entity<RivixApp>,
     /// 首帧图片路径（浮层背景显示用）。
-    frame_path: PathBuf,
     /// 预解码的首帧（背景同步显示用）。
-    frame_image: Option<Arc<rgpui::RenderImage>>,
+    frame_image: Arc<rgpui::RenderImage>,
+    /// 当前显示器的桌面物理原点。
+    origin_px: (f32, f32),
     /// 采样用底图像素（None 时取色不可用，直接取消）。
     img: Option<Arc<RgbaImage>>,
     /// 全图宽（图片像素）。
@@ -175,23 +165,25 @@ impl PickerView {
     fn new(
         _window: &mut Window,
         cx: &mut Context<Self>,
-        main: Entity<RupixApp>,
-        frame_path: PathBuf,
+        main: Entity<RivixApp>,
+        pixels: Arc<image::RgbaImage>,
         img_w: u32,
         img_h: u32,
         display_bounds: Bounds<Pixels>,
-        frame_image: Option<Arc<rgpui::RenderImage>>,
+        frame_image: Arc<rgpui::RenderImage>,
         session: Rc<OverlaySession>,
         index: usize,
     ) -> Self {
-        // 采样直接读底图像素；读不到则取色无意义，打开后第一次移动即提示并关闭。
-        let img = image::open(&frame_path)
-            .ok()
-            .map(|i| Arc::new(i.into_rgba8()));
+        let img = Some(pixels.clone());
         Self {
             main,
-            frame_path,
             frame_image,
+            origin_px: (
+                display_bounds.origin.x.as_f32() * img_w as f32
+                    / display_bounds.size.width.as_f32(),
+                display_bounds.origin.y.as_f32() * img_h as f32
+                    / display_bounds.size.height.as_f32(),
+            ),
             img,
             img_w,
             img_h,
@@ -242,6 +234,7 @@ impl PickerView {
             Some((r, g, b)) => {
                 let hex = rgb_to_hex(r, g, b);
                 cx.write_to_clipboard(ClipboardItem::new_string(hex.clone()));
+                crate::feedback::completed();
                 main.update(cx, |state, cx| {
                     // 取色结束，复位状态机（浮层期间一直是截取中）。
                     state.capturing = false;
@@ -279,7 +272,7 @@ impl PickerView {
 }
 
 /// 采样图片指定物理像素（越界返回 None）。
-fn sample_at(img: &RgbaImage, x: i32, y: i32) -> Option<(u8, u8, u8)> {
+pub(crate) fn sample_at(img: &RgbaImage, x: i32, y: i32) -> Option<(u8, u8, u8)> {
     if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 {
         return None;
     }
@@ -288,7 +281,7 @@ fn sample_at(img: &RgbaImage, x: i32, y: i32) -> Option<(u8, u8, u8)> {
 }
 
 /// RGB 转 `#RRGGBB` 大写 HEX。
-fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
+pub(crate) fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
     format!("#{r:02X}{g:02X}{b:02X}")
 }
 
@@ -305,189 +298,271 @@ fn mag_cell(img: &RgbaImage, cx: i32, cy: i32, dx: i32, dy: i32) -> Rgba {
     }
 }
 
+/// 竖卡的固定逻辑尺寸，翻边定位与渲染使用同一组值。
+pub(crate) const CARD_W: f32 = 174.0;
+pub(crate) const CARD_H: f32 = 224.0;
+
+/// 光标右下优先，碰到屏幕边缘就翻边，最后钳制在当前显示器内。
+pub(crate) fn card_position(pointer: (f32, f32), view: (f32, f32)) -> (f32, f32) {
+    let gap = 20.0;
+    let x = if pointer.0 + gap + CARD_W <= view.0 - 8.0 {
+        pointer.0 + gap
+    } else {
+        pointer.0 - gap - CARD_W
+    };
+    let y = if pointer.1 + gap + CARD_H <= view.1 - 8.0 {
+        pointer.1 + gap
+    } else {
+        pointer.1 - gap - CARD_H
+    };
+    (
+        x.clamp(8.0, (view.0 - CARD_W - 8.0).max(8.0)),
+        y.clamp(8.0, (view.1 - CARD_H - 8.0).max(8.0)),
+    )
+}
+
+/// 物理像素坐标，向边缘钳制，确保色卡中心格和 C 键采样完全一致。
+pub(crate) fn pointer_pixel(
+    pointer: (f32, f32),
+    scale: (f32, f32),
+    dimensions: (u32, u32),
+) -> (i32, i32) {
+    (
+        (pointer.0 * scale.0)
+            .round()
+            .clamp(0.0, dimensions.0.saturating_sub(1) as f32) as i32,
+        (pointer.1 * scale.1)
+            .round()
+            .clamp(0.0, dimensions.1.saturating_sub(1) as f32) as i32,
+    )
+}
+
+/// 统一的信息行：左侧标签，右侧等宽数值，与 HTML 定稿版对齐。
+fn mini_row(label: String, value: String) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .h(px(14.0))
+        .text_size(px(11.0))
+        .child(div().text_color(rgb(0x929292)).child(label))
+        .child(
+            div()
+                .font_family("Consolas")
+                .text_color(rgb(0xC0C0C0))
+                .child(value),
+        )
+}
+
+/// 原生竖向迷你色卡，直接画 19×11 个像素格，不编码图片、不创建新窗口。
+pub(crate) fn color_card(
+    image: &RgbaImage,
+    sample: (i32, i32),
+    desktop: (i32, i32),
+    selection: Option<(u32, u32)>,
+) -> Div {
+    let (r, g, b) = sample_at(image, sample.0, sample.1).unwrap_or((0, 0, 0));
+    let hex = rgb_to_hex(r, g, b);
+    let swatch = rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32);
+    let cells: Vec<_> = (-5..=5)
+        .flat_map(|dy| (-9..=9).map(move |dx| mag_cell(image, sample.0, sample.1, dx, dy)))
+        .collect();
+    let magnifier = canvas(
+        move |bounds, _, _| bounds,
+        move |_, paint_bounds, window, _| {
+            let origin = paint_bounds.origin;
+            for (i, color) in cells.iter().enumerate() {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(
+                            px(origin.x.as_f32() + (i % 19) as f32 * 8.0),
+                            px(origin.y.as_f32() + (i / 19) as f32 * 8.0),
+                        ),
+                        size(px(8.0), px(8.0)),
+                    ),
+                    *color,
+                ));
+            }
+            // 中心采样格为唯一白色细框；位置与 19×11 网格的实际中心重合。
+            for (x, y, w, h) in [
+                (72., 40., 8., 1.),
+                (72., 47., 8., 1.),
+                (72., 40., 1., 8.),
+                (79., 40., 1., 8.),
+            ] {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(px(origin.x.as_f32() + x), px(origin.y.as_f32() + y)),
+                        size(px(w), px(h)),
+                    ),
+                    rgb(0xE2E2E2),
+                ));
+            }
+        },
+    )
+    .w(px(152.0))
+    .h(px(88.0));
+    let selection = selection
+        .map(|(w, h)| format!("{w} × {h} px"))
+        .unwrap_or_else(|| "— × —".into());
+    div()
+        .w(px(CARD_W))
+        .h(px(CARD_H))
+        .p(px(10.0))
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(rgb(0x383838))
+        .bg(rgb(0x202020))
+        .text_color(rgb(0xC0C0C0))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .relative()
+                .w(px(152.0))
+                .h(px(88.0))
+                .flex_shrink_0()
+                .rounded(px(8.0))
+                .overflow_hidden()
+                .child(magnifier)
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(4.0))
+                        .bottom(px(3.0))
+                        .px_1()
+                        .rounded(px(3.0))
+                        .bg(rgba(0x181818C0))
+                        .text_size(px(11.0))
+                        .font_family("Consolas")
+                        .child("8×"),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .mt(px(12.0))
+                .h(px(20.0))
+                .child(div().w(px(14.0)).h(px(14.0)).rounded(px(4.0)).bg(swatch))
+                .child(
+                    div()
+                        .font_family("Consolas")
+                        .text_size(px(15.0))
+                        .text_color(rgb(0xE5E5E5))
+                        .child(hex),
+                ),
+        )
+        .child(div().mt(px(9.0)).child(mini_row(
+            tr("mini.coordinates"),
+            format!("x {}  y {}", desktop.0, desktop.1),
+        )))
+        .child(
+            div()
+                .mt(px(7.0))
+                .child(mini_row(tr("mini.selection"), selection)),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .mt(px(10.0))
+                .pt(px(8.0))
+                .border_t_1()
+                .border_color(rgb(0x303030))
+                .children(
+                    [
+                        ("C", tr("mini.pick")),
+                        ("T", tr("mini.ocr")),
+                        ("S", tr("mini.save")),
+                    ]
+                    .into_iter()
+                    .map(|(key, label)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x949494))
+                            .child(
+                                div()
+                                    .px_1()
+                                    .h(px(18.0))
+                                    .rounded(px(4.0))
+                                    .border_1()
+                                    .border_color(rgb(0x414141))
+                                    .bg(rgb(0x282828))
+                                    .font_family("Consolas")
+                                    .child(key),
+                            )
+                            .child(label)
+                    }),
+                ),
+        )
+}
+
 impl Render for PickerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 顶栏提示 + 当前颜色（无光标时显示占位）。
-        let (hex, rgb_text, swatch) = match self.sample() {
-            Some((r, g, b)) => (
-                rgb_to_hex(r, g, b),
-                format!("RGB({r}, {g}, {b})"),
-                Rgba {
-                    r: r as f32 / 255.0,
-                    g: g as f32 / 255.0,
-                    b: b as f32 / 255.0,
-                    a: 1.0,
-                },
-            ),
-            None => (
-                tr("picker.move_hint"),
-                tr("picker.click_hint"),
-                Rgba {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.0,
-                },
-            ),
-        };
-
         let mut root = div()
+            .id("picker-overlay")
             .size_full()
             .relative()
             .child(
-                div()
-                    .absolute()
-                    .size_full()
-                    .child(match self.frame_image.clone() {
-                        Some(pre) => img(pre).w(px(self.view_w)).h(px(self.view_h)),
-                        None => img(self.frame_path.clone())
-                            .w(px(self.view_w))
-                            .h(px(self.view_h)),
-                    }),
+                img(self.frame_image.clone())
+                    .w(px(self.view_w))
+                    .h(px(self.view_h)),
             )
-            // 根视图可聚焦，使 Esc 立即可用。
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key.as_str() == "escape" {
-                    this.cancel(window, cx);
+            .cursor(CursorStyle::Crosshair)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.cursor = None;
+                    cx.notify();
                 }
             }))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
-                this.on_move(ev, cx);
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => this.cancel(window, cx),
+                    "c" if !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform =>
+                    {
+                        this.on_pick(window, cx)
+                    }
+                    _ => {}
+                }
             }))
+            .on_mouse_move(
+                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_move(event, cx)),
+            )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                    this.on_pick(window, cx);
-                }),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| this.on_pick(window, cx)),
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                    this.cancel(window, cx);
-                }),
-            )
-            // 顶部信息条：色块 + HEX + RGB。
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .top(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(0x000000))
-                    .child(div().w(px(22.)).h(px(22.)).rounded_sm().bg(swatch))
-                    .child(div().text_sm().text_color(rgb(0xFFFFFF)).child(hex))
-                    .child(div().text_xs().text_color(rgb(0xBBBBBB)).child(rgb_text)),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| this.cancel(window, cx)),
             );
-
-        // 十字线 + 放大镜（有光标时才画）。
-        if let Some((mx, my)) = self.cursor
-            && let Some(img) = self.img.clone()
-        {
-            let (sx, sy) = self.scale();
-            let cx_img = (mx * sx).round() as i32;
-            let cy_img = (my * sy).round() as i32;
-            // 放大镜面板贴在光标右下方，越界则翻到左上方。
-            let mut px0 = mx + 24.0;
-            let mut py0 = my + 24.0;
-            if px0 + MAG_W + 16.0 > self.view_w {
-                px0 = mx - 24.0 - MAG_W - 16.0;
-            }
-            if py0 + MAG_W + 16.0 > self.view_h {
-                py0 = my - 24.0 - MAG_W - 16.0;
-            }
-            // 9×9 格颜色提前算好，画布闭包只做绘制（闭包需 'static，用 owned 数据）。
-            let mut cells = Vec::with_capacity((MAG_N * MAG_N) as usize);
-            let half = MAG_N / 2;
-            for dy in -half..=half {
-                for dx in -half..=half {
-                    cells.push(mag_cell(&img, cx_img, cy_img, dx, dy));
-                }
-            }
-            root = root
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(0.))
-                        .top(px(my))
-                        .w(px(self.view_w))
-                        .h(px(1.))
-                        .bg(rgba(0xFFFFFF80)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(mx))
-                        .top(px(0.))
-                        .w(px(1.))
-                        .h(px(self.view_h))
-                        .bg(rgba(0xFFFFFF80)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(px0))
-                        .top(px(py0))
-                        .w(px(MAG_W + 16.0))
-                        .rounded_md()
-                        .bg(rgb(0x000000))
-                        .p_2()
-                        .child(canvas(
-                            move |bounds, _, _| bounds,
-                            move |_bounds, paint_bounds, window, _| {
-                                let origin = paint_bounds.origin;
-                                let n = MAG_N as usize;
-                                for (i, color) in cells.iter().enumerate() {
-                                    let gx = (i % n) as f32;
-                                    let gy = (i / n) as f32;
-                                    let bounds = Bounds::new(
-                                        point(
-                                            px(origin.x.as_f32() + gx * MAG_Z),
-                                            px(origin.y.as_f32() + gy * MAG_Z),
-                                        ),
-                                        size(px(MAG_Z), px(MAG_Z)),
-                                    );
-                                    window.paint_quad(fill(bounds, *color));
-                                }
-                                // 中心格白色描边（2px 四条）。
-                                let c0 = MAG_N as f32 / 2.0 * MAG_Z;
-                                let ox = origin.x.as_f32();
-                                let oy = origin.y.as_f32();
-                                let white = Rgba {
-                                    r: 1.0,
-                                    g: 1.0,
-                                    b: 1.0,
-                                    a: 1.0,
-                                };
-                                let bars = [
-                                    (c0, c0, MAG_Z, 2.0),
-                                    (c0, c0 + MAG_Z - 2.0, MAG_Z, 2.0),
-                                    (c0, c0, 2.0, MAG_Z),
-                                    (c0 + MAG_Z - 2.0, c0, 2.0, MAG_Z),
-                                ];
-                                for (bx, by, bw, bh) in bars {
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(px(ox + bx), px(oy + by)),
-                                            size(px(bw), px(bh)),
-                                        ),
-                                        white,
-                                    ));
-                                }
-                            },
-                        ))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xBBBBBB))
-                                .child(format!("{cx_img}, {cy_img}")),
-                        ),
-                );
+        if let (Some(pointer), Some(image)) = (self.cursor, self.img.as_ref()) {
+            let sample = pointer_pixel(
+                pointer,
+                (
+                    self.img_w as f32 / self.view_w,
+                    self.img_h as f32 / self.view_h,
+                ),
+                (self.img_w, self.img_h),
+            );
+            let (x, y) = card_position(pointer, (self.view_w, self.view_h));
+            root = root.child(div().absolute().left(px(x)).top(px(y)).child(color_card(
+                image,
+                sample,
+                (
+                    (self.origin_px.0 + sample.0 as f32).round() as i32,
+                    (self.origin_px.1 + sample.1 as f32).round() as i32,
+                ),
+                None,
+            )));
         }
         root
     }
@@ -498,6 +573,24 @@ mod tests {
     //! 取色模块单测：采样与 HEX 格式化（纯函数，不依赖窗口）。
 
     use super::*;
+
+    /// 高 DPI、边缘采样与色卡翻边，不能读错像素或跑出屏幕。
+    #[test]
+    fn mini_card_pixel_and_placement() {
+        assert_eq!(
+            pointer_pixel((10.0, 20.0), (1.5, 1.5), (100, 100)),
+            (15, 30)
+        );
+        assert_eq!(
+            pointer_pixel((-4.0, 100.0), (1.0, 1.0), (100, 100)),
+            (0, 99)
+        );
+        for point in [(0.0, 0.0), (999.0, 799.0), (500.0, 400.0)] {
+            let (x, y) = card_position(point, (1000.0, 800.0));
+            assert!(x >= 8.0 && y >= 8.0 && x + CARD_W <= 992.0 && y + CARD_H <= 792.0);
+        }
+        assert!(card_position((999.0, 799.0), (1000.0, 800.0)).0 < 999.0 - CARD_W);
+    }
 
     /// 采样越界与 HEX 格式断言。
     #[test]

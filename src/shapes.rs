@@ -3,6 +3,9 @@
 //! UI（`overlay`）只操作这些数据，落盘时的栅格化由 `export` 负责，
 //! 两边共用同一套坐标约定，避免换算分歧。
 
+/// 文字统一使用 150% 行高，输入预览、命中框和导出共用。
+pub const TEXT_LINE_HEIGHT: f32 = 1.5;
+
 /// 图片像素坐标系下的矩形：左上角 `(x, y)` 加宽高。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PixelRect {
@@ -72,11 +75,13 @@ impl AnnoColor {
     }
 
     /// 转为 rgpui Hsla 颜色（颜色选择器用）。
+    #[allow(dead_code)]
     pub fn to_hsla(self) -> rgpui::Hsla {
         self.to_rgpui().into()
     }
 
     /// 从 rgpui Hsla 颜色构造标注颜色（透明度固定为不透明）。
+    #[allow(dead_code)]
     pub fn from_hsla(color: rgpui::Hsla) -> Self {
         let rgba: rgpui::Rgba = color.into();
         Self(
@@ -162,15 +167,36 @@ pub enum Shape {
     Rect {
         /// 矩形区域。
         rect: PixelRect,
-        /// 颜色。
+        /// 描边颜色。
         color: AnnoColor,
         /// 线宽（图片像素）。
         width: f32,
+        /// 填充颜色（None 表示无填充）。
+        fill: Option<AnnoColor>,
+        /// 是否启用描边。
+        has_stroke: bool,
+        /// 圆角半径（图片像素，0 表示直角）。
+        radius: f32,
     },
     /// 椭圆框（外接矩形确定）。
     Ellipse {
         /// 外接矩形。
         rect: PixelRect,
+        /// 描边颜色。
+        color: AnnoColor,
+        /// 线宽（图片像素）。
+        width: f32,
+        /// 填充颜色（None 表示无填充）。
+        fill: Option<AnnoColor>,
+        /// 是否启用描边。
+        has_stroke: bool,
+    },
+    /// 直线，端点坐标使用原图像素。
+    Line {
+        /// 起点。
+        from: (f32, f32),
+        /// 终点。
+        to: (f32, f32),
         /// 颜色。
         color: AnnoColor,
         /// 线宽（图片像素）。
@@ -187,12 +213,25 @@ pub enum Shape {
         /// 线宽（图片像素）。
         width: f32,
     },
+    /// 闭合多边形：由矩形 / 椭圆旋转后转换而来，支持任意角度继续旋转与缩放。
+    Polygon {
+        /// 闭合顶点列（导出与绘制时自动首尾相连）。
+        pts: Vec<(f32, f32)>,
+        /// 描边颜色。
+        color: AnnoColor,
+        /// 线宽（图片像素）。
+        width: f32,
+        /// 填充颜色（None 表示无填充）。
+        fill: Option<AnnoColor>,
+        /// 是否启用描边。
+        has_stroke: bool,
+    },
     /// 马赛克：矩形区域打码。
     Mosaic {
         /// 打码区域。
         rect: PixelRect,
     },
-    /// 文字：点击落点 + 单行文本。
+    /// 文字：点击落点（单行）或拖拽文本框（自动换行）。
     Text {
         /// 落点（文本左上角附近）。
         pos: (f32, f32),
@@ -206,6 +245,14 @@ pub enum Shape {
         bg: bool,
         /// 底色（按条独立存储，可经取色器设置；新建默认跟随字色自适应）。
         bg_color: AnnoColor,
+        /// 文本框最大宽度（`None` 表示单行自由文本，`Some(w)` 表示按 `w` 自动换行）。
+        max_w: Option<f32>,
+        /// 字体名称（`None` 表示默认系统字体）。
+        font_family: Option<String>,
+        /// 文字圆角外描边颜色（`None` 表示无文字描边；绘制于文字本体之下）。
+        stroke_color: Option<AnnoColor>,
+        /// 文字圆角外描边粗细（图片像素）。
+        stroke_width: f32,
     },
 }
 
@@ -214,7 +261,9 @@ impl Shape {
     pub fn bbox(&self) -> PixelRect {
         match self {
             // 点列取极值并向外扩展线宽，避免细线点不中。
-            Self::Pen { pts, width, .. } | Self::Highlighter { pts, width, .. } => {
+            Self::Pen { pts, width, .. }
+            | Self::Highlighter { pts, width, .. }
+            | Self::Polygon { pts, width, .. } => {
                 let mut min_x = f32::MAX;
                 let mut min_y = f32::MAX;
                 let mut max_x = f32::MIN;
@@ -239,7 +288,10 @@ impl Shape {
                 rect.w + width * 2.0,
                 rect.h + width * 2.0,
             ),
-            Self::Arrow {
+            Self::Line {
+                from, to, width, ..
+            }
+            | Self::Arrow {
                 from, to, width, ..
             } => {
                 let rect = PixelRect::from_points(*from, *to);
@@ -251,15 +303,45 @@ impl Shape {
                 )
             }
             Self::Mosaic { rect } => *rect,
-            // 文本按“字数 × 字号”估算宽度，命中测试够用即可。
+            // 文本框按固定框宽逐段折行估算高度；单行按字符宽度估算。
             Self::Text {
-                pos, content, size, ..
-            } => PixelRect::new(
-                pos.0,
-                pos.1,
-                content.chars().count() as f32 * size * 0.9,
-                size * 1.3,
-            ),
+                pos,
+                content,
+                size,
+                max_w,
+                ..
+            } => {
+                let char_w = |ch: char| {
+                    if ch.is_ascii() { size * 0.55 } else { *size }
+                };
+                if let Some(box_w) = max_w {
+                    let limit = box_w.max(*size);
+                    let mut lines = 0usize;
+                    for para in content.split('\n') {
+                        let mut cur_w = 0.0f32;
+                        let mut para_lines = 1usize;
+                        for ch in para.chars() {
+                            let cw = char_w(ch);
+                            if cur_w > 0.0 && cur_w + cw > limit {
+                                para_lines += 1;
+                                cur_w = cw;
+                            } else {
+                                cur_w += cw;
+                            }
+                        }
+                        lines += para_lines;
+                    }
+                    PixelRect::new(
+                        pos.0,
+                        pos.1,
+                        *box_w,
+                        (lines.max(1) as f32) * size * TEXT_LINE_HEIGHT,
+                    )
+                } else {
+                    let w: f32 = content.chars().map(char_w).sum();
+                    PixelRect::new(pos.0, pos.1, w, size * TEXT_LINE_HEIGHT)
+                }
+            }
         }
         .normalized_for_hit_test()
     }

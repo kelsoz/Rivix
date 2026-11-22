@@ -26,9 +26,15 @@ pub fn list_windows() -> Vec<CaptureWindow> {
     imp::list_windows()
 }
 
-/// 命中指定物理像素点的最顶层窗口（从上往下第一个包含该点的）。
-pub fn hit_test(x: i32, y: i32) -> Option<CaptureWindow> {
-    list_windows().into_iter().find(|w| w.contains(x, y))
+#[cfg(target_os = "windows")]
+fn win32_hwnd(window: &rgpui::Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(HWND(win32.hwnd.get() as *mut core::ffi::c_void)),
+        _ => None,
+    }
 }
 
 /// 把自身窗口排除出系统抓屏（提示胶囊用，避免出现在下一张截图里）。
@@ -40,19 +46,10 @@ pub fn hit_test(x: i32, y: i32) -> Option<CaptureWindow> {
 /// - `window`: 要排除的顶层窗口（rgpui 的 `Window`）。
 #[cfg(target_os = "windows")]
 pub fn exclude_from_capture(window: &rgpui::Window) {
-    use raw_window_handle::RawWindowHandle;
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
     };
-    // rgpui 的 `Window` 自带的方法是取 `AnyWindowHandle`（类型擦除句柄），
-    // 拿原生 HWND 只能走 raw-window-handle 的 `HasWindowHandle` trait。
-    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
-        return;
-    };
-    if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-        // raw-window-handle 的 hwnd 是 NonZeroIsize，直接按指针重建 HWND。
-        let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
+    if let Some(hwnd) = win32_hwnd(window) {
         unsafe {
             let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         }
@@ -62,6 +59,234 @@ pub fn exclude_from_capture(window: &rgpui::Window) {
 /// 非 Windows 平台暂无对应能力，留空实现（提示照常显示，只是可能被截进去）。
 #[cfg(not(target_os = "windows"))]
 pub fn exclude_from_capture(_window: &rgpui::Window) {}
+
+/// 将窗口设为全局置顶且不抢焦点（用于录屏红框与悬浮控制条，切换其他应用后仍可见）。
+#[cfg(target_os = "windows")]
+pub fn set_always_on_top(window: &rgpui::Window) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+    if let Some(hwnd) = win32_hwnd(window) {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// 非 Windows 平台暂留空实现。
+#[cfg(not(target_os = "windows"))]
+pub fn set_always_on_top(_window: &rgpui::Window) {}
+
+/// 切换窗口最大化与还原状态（弥补 Windows 后端 `zoom_window()` 只放大不还原的限制）。
+#[cfg(target_os = "windows")]
+pub fn toggle_maximize(window: &rgpui::Window) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsZoomed, SW_MAXIMIZE, SW_RESTORE, ShowWindowAsync,
+    };
+    if let Some(hwnd) = win32_hwnd(window) {
+        unsafe {
+            let cmd = if IsZoomed(hwnd).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_MAXIMIZE
+            };
+            let _ = ShowWindowAsync(hwnd, cmd);
+        }
+    }
+}
+
+/// 查询当前窗口是否处于最大化状态。
+#[cfg(target_os = "windows")]
+pub fn is_maximized(window: &rgpui::Window) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsZoomed;
+    win32_hwnd(window)
+        .map(|hwnd| unsafe { IsZoomed(hwnd).as_bool() })
+        .unwrap_or(false)
+}
+
+/// 非 Windows 平台直接调用 rgpui 窗口缩放切换。
+#[cfg(not(target_os = "windows"))]
+pub fn toggle_maximize(window: &rgpui::Window) {
+    window.zoom_window();
+}
+
+/// 非 Windows 平台暂返回 false。
+#[cfg(not(target_os = "windows"))]
+pub fn is_maximized(_window: &rgpui::Window) -> bool {
+    false
+}
+
+/// 原生透明置顶红框窗口句柄（用于录屏区域提示，内部完全穿透点击）。
+#[derive(Clone, Copy)]
+pub struct BorderWindowHandle(pub isize);
+
+/// 创建并显示一个原生 Win32 分层置顶空心红框窗口（`LWA_COLORKEY` 抠除纯黑背景，四边精准 3px 红线）。
+#[cfg(target_os = "windows")]
+pub fn open_border_window(x: i32, y: i32, width: i32, height: i32) -> Option<BorderWindowHandle> {
+    use std::sync::Once;
+    use windows::{
+        Win32::{
+            Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+            Graphics::Gdi::{
+                BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
+            },
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, HWND_TOPMOST,
+                LWA_COLORKEY, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
+                ShowWindow, WDA_EXCLUDEFROMCAPTURE, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
+                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+            },
+        },
+        core::w,
+    };
+
+    const CLASS_NAME: windows::core::PCWSTR = w!("RivixRecordBorder");
+    static REG: Once = Once::new();
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_PAINT {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+            let mut rc = RECT::default();
+            if unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rc) }
+                .is_ok()
+            {
+                // 纯黑背景作为 ColorKey 透明抠除，四边各画 3px 红色边框。
+                let black = unsafe { CreateSolidBrush(COLORREF(0x0000_0000)) };
+                let red = unsafe { CreateSolidBrush(COLORREF(0x0031_31E0)) }; // BGR: RGB(224, 49, 49)
+                unsafe {
+                    FillRect(hdc, &rc, black);
+                    let t = 3i32;
+                    let top = RECT {
+                        left: 0,
+                        top: 0,
+                        right: rc.right,
+                        bottom: t.min(rc.bottom),
+                    };
+                    let bottom = RECT {
+                        left: 0,
+                        top: (rc.bottom - t).max(0),
+                        right: rc.right,
+                        bottom: rc.bottom,
+                    };
+                    let left = RECT {
+                        left: 0,
+                        top: 0,
+                        right: t.min(rc.right),
+                        bottom: rc.bottom,
+                    };
+                    let right = RECT {
+                        left: (rc.right - t).max(0),
+                        top: 0,
+                        right: rc.right,
+                        bottom: rc.bottom,
+                    };
+                    FillRect(hdc, &top, red);
+                    FillRect(hdc, &bottom, red);
+                    FillRect(hdc, &left, red);
+                    FillRect(hdc, &right, red);
+                    let _ = DeleteObject(black.into());
+                    let _ = DeleteObject(red.into());
+                }
+            }
+            unsafe {
+                let _ = EndPaint(hwnd, &ps);
+            }
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    let hinstance = unsafe { GetModuleHandleW(None) }.ok()?;
+    REG.call_once(|| {
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: hinstance.into(),
+            lpszClassName: CLASS_NAME,
+            ..Default::default()
+        };
+        unsafe {
+            RegisterClassW(&wc);
+        }
+    });
+
+    let ex_style =
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+    let hwnd = unsafe {
+        CreateWindowExW(
+            ex_style,
+            CLASS_NAME,
+            w!(""),
+            WS_POPUP,
+            x,
+            y,
+            width.max(12),
+            height.max(12),
+            None,
+            None,
+            Some(hinstance.into()),
+            None,
+        )
+    }
+    .ok()?;
+
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0x0000_0000), 0, LWA_COLORKEY);
+        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    Some(BorderWindowHandle(hwnd.0 as isize))
+}
+
+/// 关闭原生透明红框窗口。
+#[cfg(target_os = "windows")]
+pub fn close_border_window(handle: BorderWindowHandle) {
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::DestroyWindow};
+    let hwnd = HWND(handle.0 as *mut core::ffi::c_void);
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+/// 非 Windows 平台空实现。
+#[cfg(not(target_os = "windows"))]
+pub fn open_border_window(
+    _x: i32,
+    _y: i32,
+    _width: i32,
+    _height: i32,
+) -> Option<BorderWindowHandle> {
+    None
+}
+
+/// 非 Windows 平台空实现。
+#[cfg(not(target_os = "windows"))]
+pub fn close_border_window(_handle: BorderWindowHandle) {}
 
 /// Windows 实现：EnumWindows 按 Z 序枚举，过滤不可见 / 最小化 / 幽灵窗口与自身进程。
 #[cfg(target_os = "windows")]

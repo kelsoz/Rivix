@@ -1,108 +1,113 @@
-//! 截图保存提示：屏幕右下角闪一下的小胶囊。
-//!
-//! Rupix 默认「截完不弹编辑窗」（见 [`crate::app::load_open_editor`]），但「到底截到
-//! 没有」必须有反馈，否则用户会以为没截上、连按几次热键。这里用一枚独立的角标窗口
-//! 交代结果：
-//!
-//! - **不抢焦点**（`focus: false`）：键盘焦点留在原程序，截完可以直接 `Ctrl+V`；
-//! - **自动消失**：1.6 秒后移除窗口，不占屏幕、不进任务栏；
-//! - **不进下一张截图**：与截图浮层同样排除出系统抓屏（Windows `WDA_EXCLUDEFROMCAPTURE`），
-//!   免得连按两次快捷键时把上一次的提示胶囊也截进去。
+//! 桌面提示：低饱和深色胶囊，底部居中，上升淡入、停留后下降淡出。
+//! 使用原生 rgpui 动画与独立透明窗口，不抢焦点，且排除出截图。
 
-use std::{path::Path, time::Duration};
-
+use crate::window::exclude_from_capture;
 use rgpui::{
-    App, Bounds, Context, Render, SharedString, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, div, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt as _, App, Bounds, Context, Render, SharedString, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, prelude::*,
+    px, rgb, rgba, size,
 };
+use std::time::Duration;
 
-use crate::{i18n::tr, window::exclude_from_capture};
+/// 一轮提示总时长：200ms 进入、1400ms 停留、200ms 退出。
+const TOAST_MS: u64 = 1800;
+/// 胶囊逻辑宽高，与字体缩放无关的基础尺寸。
+const TOAST_W: f32 = 280.0;
+const TOAST_H: f32 = 64.0;
+/// 透明窗口留边，供描边及动画移动，避免被窗口裁切。
+const PAD: f32 = 12.0;
+const SLIDE: f32 = 24.0;
+/// 胶囊停留位置距屏幕底部，留出任务栏空间。
+const BOTTOM: f32 = 96.0;
 
-/// 提示停留时长（毫秒）：够看清一行字，又不至于挡事。
-const TOAST_MS: u64 = 1600;
-
-/// 胶囊宽度（逻辑像素）。
-const TOAST_W: f32 = 300.0;
-
-/// 胶囊高度（逻辑像素）：两行小字 + 内边距。
-const TOAST_H: f32 = 56.0;
-
-/// 距屏幕右下角的边距（逻辑像素）。
-const TOAST_MARGIN: f32 = 24.0;
-
-/// 保存提示视图（一枚静态胶囊，没有交互）。
+/// 提示视图：图标与单行状态，不为不存在的副标题留空。
 struct SaveToast {
-    /// 主行：结果（已保存 / 已保存并复制）。
+    /// 状态文字，出错时仍展示实际错误。
     title: SharedString,
-    /// 副行：文件名（太长时裁掉，不换行撑破窗口）。
-    detail: SharedString,
 }
 
 impl Render for SaveToast {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().p_1().child(
-            div()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .gap_0p5()
-                .size_full()
-                .px_3()
-                .rounded_lg()
-                // 深灰底 + 白字：在亮色桌面与暗色桌面上都看得清。
-                .bg(rgb(0x1F2937))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0xFFFFFF))
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .child(self.title.clone()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0xD1D5DB))
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .child(self.detail.clone()),
-                ),
-        )
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let card = div()
+            .absolute()
+            .left(px(PAD))
+            .w(px(TOAST_W))
+            .h(px(TOAST_H))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .px_5()
+            .rounded(px(TOAST_H / 2.0))
+            .border_1()
+            .border_color(rgb(0x383838))
+            .bg(rgba(0x202020F5))
+            .text_color(rgb(0xC0C0C0))
+            // 用几何轮廓画剪贴板，避免额外字体或图标资源依赖。
+            .child(
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .w(px(15.0))
+                    .h(px(18.0))
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(rgb(0xC0C0C0))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(3.0))
+                            .top(px(-3.0))
+                            .w(px(7.0))
+                            .h(px(5.0))
+                            .rounded(px(2.0))
+                            .border_1()
+                            .border_color(rgb(0xC0C0C0))
+                            .bg(rgb(0x202020)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(self.title.clone()),
+            );
+        div().size_full().child(card.with_animation(
+            "toast-motion",
+            Animation::new(Duration::from_millis(TOAST_MS)),
+            |card, phase| {
+                let (offset, opacity) = motion(phase);
+                card.top(px(PAD + offset)).opacity(opacity)
+            },
+        ))
     }
 }
 
-/// 显示「截图已保存」提示。
-///
-/// # 参数
-/// - `cx`: 应用上下文（开窗口 + 挂自动关闭定时器）。
-/// - `path`: 自动保存后的图片路径（只取文件名展示）。
-/// - `copied`: 是否已顺手写进剪贴板（决定主行文案）。
-pub fn show_saved(cx: &mut App, path: &Path, copied: bool) {
-    let title = if copied {
-        tr("toast.saved_copied")
+/// 入场减速、退场加速；中段保持静止，动画结束时已完全透明。
+fn motion(phase: f32) -> (f32, f32) {
+    let elapsed = phase.clamp(0.0, 1.0) * TOAST_MS as f32;
+    let visible = if elapsed < 200.0 {
+        1.0 - (1.0 - elapsed / 200.0).powi(3)
+    } else if elapsed > 1600.0 {
+        1.0 - ((elapsed - 1600.0) / 200.0).powi(3)
     } else {
-        tr("toast.saved")
+        1.0
     };
-    // 只显示文件名：完整路径太长，胶囊里放不下，用户也不靠它定位。
-    let detail = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default();
-    show(cx, title, detail);
+    (SLIDE * (1.0 - visible), visible)
 }
 
-/// 在屏幕右下角开一枚提示，到时自动关掉。
+/// 在屏幕底部居中开一枚提示，到时自动关掉。
 ///
 /// # 参数
 /// - `title`: 主行文案。
-/// - `detail`: 副行文案（一般是文件名）。
-fn show(cx: &mut App, title: String, detail: String) {
+pub(crate) fn show(cx: &mut App, title: String) {
     let (x, y) = toast_pos(cx);
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(x), px(y)),
-                size: size(px(TOAST_W), px(TOAST_H)),
+                size: size(px(TOAST_W + PAD * 2.0), px(TOAST_H + PAD * 2.0 + SLIDE)),
             })),
             titlebar: None,
             // 置顶浮层。Windows 用透明背景让圆角外真正透出桌面；
@@ -125,14 +130,13 @@ fn show(cx: &mut App, title: String, detail: String) {
             // 这里**不要**调 `set_mouse_passthrough(true)`：它会给窗口补上
             // `WS_EX_LAYERED`，而本窗口走的是 DirectComposition（无重定向位图），
             // 两者一起用时窗口只剩内容、不参与屏幕合成——提示会彻底看不见。
-            // 提示只活 1.6 秒且贴右下角，被点到也不影响截图结果，不值得为穿透牺牲可见性。
+            // 提示只活 1.6 秒且不抢焦点，被点到也不影响截图结果，不值得为穿透牺牲可见性。
             cx.new(|_| SaveToast {
                 title: SharedString::from(title),
-                detail: SharedString::from(detail),
             })
         },
     );
-    // 建窗失败只影响这条提示，不打断截图流程（图已经存好、也复制好了）。
+    // 建窗失败只影响这条提示，不打断截图流程（剪贴板内容不受影响）。
     let Ok(handle) = opened else {
         return;
     };
@@ -148,9 +152,7 @@ fn show(cx: &mut App, title: String, detail: String) {
     .detach();
 }
 
-/// 计算提示窗口左上角坐标：主显示器右下角，留出边距。
-///
-/// 用显示器 `origin + size` 而不是假定原点为 0：多显示器时主屏可能不是最左边那块。
+/// 根据显示器原点计算底部居中位置，兼容主屏不在桌面原点的情况。
 fn toast_pos(cx: &App) -> (f32, f32) {
     let (ox, oy, w, h) = cx
         .primary_display()
@@ -165,7 +167,23 @@ fn toast_pos(cx: &App) -> (f32, f32) {
         })
         .unwrap_or((0.0, 0.0, 1920.0, 1080.0));
     (
-        ox + w - TOAST_W - TOAST_MARGIN,
-        oy + h - TOAST_H - TOAST_MARGIN,
+        ox + (w - TOAST_W - PAD * 2.0) / 2.0,
+        oy + h - BOTTOM - TOAST_H - PAD,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! 验证提示完整进出，不在关闭窗口前突然截断。
+    use super::*;
+    #[test]
+    fn motion_enters_holds_and_exits() {
+        assert_eq!(motion(0.0), (SLIDE, 0.0));
+        assert_eq!(motion(0.5), (0.0, 1.0));
+        assert_eq!(motion(1.0), (SLIDE, 0.0));
+        let entry = motion(0.05);
+        let exit = motion(0.95);
+        assert!(entry.0 > 0.0 && entry.0 < SLIDE && entry.1 > 0.0);
+        assert!(exit.0 > 0.0 && exit.0 < SLIDE && exit.1 > 0.0);
+    }
 }

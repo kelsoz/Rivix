@@ -5,9 +5,9 @@
 //!
 //! - Windows：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 写一个 `REG_SZ`
 //!   （值为带引号的 exe 绝对路径）；
-//! - macOS：`~/Library/LaunchAgents/com.launcher-rs.rupix.plist`
+//! - macOS：`~/Library/LaunchAgents/com.launcher-rs.rivix.plist`
 //!   （写完顺手 `launchctl bootstrap` 让本回会话立即生效，失败忽略，登录必生效）；
-//! - Linux：`~/.config/autostart/rupix.desktop`（XDG autostart，桌面环境登录时读取）。
+//! - Linux：`~/.config/autostart/rivix.desktop`（XDG autostart，桌面环境登录时读取）。
 //!
 //! 全部只写“当前用户”范围的项，不需要管理员 / root 权限；
 //! 关闭时删除登记即可，不留残留。
@@ -21,6 +21,7 @@ fn exe_path() -> Result<PathBuf> {
 }
 
 /// 当前平台是否支持开机启动（Windows / macOS / Linux 支持，其余平台设置页隐藏开关）。
+#[allow(dead_code)]
 pub fn is_supported() -> bool {
     cfg!(any(
         target_os = "windows",
@@ -64,7 +65,7 @@ mod platform {
     /// Run 键路径（HKCU = 当前用户，无需管理员权限）。
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     /// 自启动项的值名。
-    const VALUE_NAME: &str = "Rupix";
+    const VALUE_NAME: &str = "Rivix";
 
     /// Rust 字符串 → UTF-16 终止串（所有 `*W` 系 API 都要 `PCWSTR`）。
     fn wide(text: &str) -> Vec<u16> {
@@ -184,22 +185,22 @@ mod platform {
         /// 解码后应能与裸路径正常比对。
         #[test]
         fn decode_reg_sz_strips_quotes_and_trailing_nul() {
-            let raw: Vec<u16> = "\"C:\\Program Files\\rupix.exe\"\0"
+            let raw: Vec<u16> = "\"C:\\Program Files\\rivix.exe\"\0"
                 .encode_utf16()
                 .collect();
             // 结尾 NUL 先被剥掉，trim_matches('"') 才能把两侧引号都去掉。
             assert!(
                 decode_reg_sz(&raw)
                     .trim_matches('"')
-                    .eq_ignore_ascii_case("c:\\program files\\rupix.exe")
+                    .eq_ignore_ascii_case("c:\\program files\\rivix.exe")
             );
         }
 
         /// 无引号登记 + 连续多个 NUL 的数据也应被正确剥离。
         #[test]
         fn decode_reg_sz_handles_unquoted_and_multi_nul() {
-            let raw: Vec<u16> = "C:\\a\\rupix.exe\0\0".encode_utf16().collect();
-            assert_eq!(decode_reg_sz(&raw), "C:\\a\\rupix.exe");
+            let raw: Vec<u16> = "C:\\a\\rivix.exe\0\0".encode_utf16().collect();
+            assert_eq!(decode_reg_sz(&raw), "C:\\a\\rivix.exe");
         }
     }
 }
@@ -215,7 +216,7 @@ mod platform {
     use std::path::{Path, PathBuf};
 
     /// LaunchAgent 的 Label，也用作 plist 文件名。
-    const LABEL: &str = "com.launcher-rs.rupix";
+    const LABEL: &str = "com.launcher-rs.rivix";
 
     /// plist 文件路径：`~/Library/LaunchAgents/<LABEL>.plist`。
     fn file() -> Result<PathBuf> {
@@ -343,14 +344,14 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    //! Linux 实现：写 XDG autostart 文件 `~/.config/autostart/rupix.desktop`。
+    //! Linux 实现：写 XDG autostart 文件 `~/.config/autostart/rivix.desktop`。
 
     use super::exe_path;
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
 
     /// autostart 文件名。
-    const FILE_NAME: &str = "rupix.desktop";
+    const FILE_NAME: &str = "rivix.desktop";
 
     /// autostart 文件路径：优先 `XDG_CONFIG_HOME`，未设置按规范回退 `~/.config`。
     fn file() -> Result<PathBuf> {
@@ -379,8 +380,8 @@ mod platform {
         format!(
             "[Desktop Entry]\n\
              Type=Application\n\
-             Name=Rupix 拾景\n\
-             Comment=Rupix lightweight screenshot tool\n\
+             Name=Rivix 望川\n\
+             Comment=Rivix lightweight screenshot tool\n\
              Exec=\"{exe}\"\n\
              Terminal=false\n\
              X-GNOME-Autostart-enabled=true\n"

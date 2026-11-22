@@ -4,10 +4,10 @@
 //! 直线 / 矩形 / 椭圆 / 箭头用笔刷印章法绘制，马赛克用分块取色，
 //! 文字用系统字体的字形位图逐字拼排（依赖 `ab_glyph`，不引入重量级排版库）。
 
-use std::{io::Cursor, path::Path};
+use std::path::{Path, PathBuf};
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont as _, point};
-use image::{DynamicImage, ImageFormat as ImgFormat, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage};
 
 use crate::{
     i18n::tr,
@@ -52,9 +52,19 @@ pub fn render_export(
 
 /// 把图片编码为 PNG 字节（保存文件与复制剪贴板共用）。
 pub fn png_bytes(img: &RgbaImage) -> Option<Vec<u8>> {
+    use image::{
+        ImageEncoder,
+        codecs::png::{CompressionType, FilterType, PngEncoder},
+    };
     let mut buf = Vec::new();
-    DynamicImage::ImageRgba8(img.clone())
-        .write_to(&mut Cursor::new(&mut buf), ImgFormat::Png)
+    // 截图只需无损像素，快速 PNG 编码减少等待，不克隆整张图片。
+    PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Adaptive)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
         .ok()?;
     Some(buf)
 }
@@ -70,27 +80,6 @@ pub fn copy_png_to_clipboard(cx: &mut rgpui::App, png: &[u8]) -> Result<(), Stri
     Ok(())
 }
 
-/// 把已保存的 PNG 文件写进剪贴板，优先「图片 + 文件」双格式。
-///
-/// 与预览窗的「复制」同款：聊天 / 文档里粘成图片，资源管理器里粘成图片文件。
-/// 双格式不可用（非 Windows）或写入失败时退化为只写图片，保证至少能粘图。
-///
-/// # 参数
-/// - `cx`: 应用上下文（退化路径写图片剪贴板用）。
-/// - `path`: 已保存的 PNG 文件路径。
-///
-/// # 返回
-/// 写入成功返回 `Ok(())`；两种方式都失败时返回合并后的错误说明（调用方只记日志）。
-pub fn copy_saved_png(cx: &mut rgpui::App, path: &Path) -> Result<(), String> {
-    let png = std::fs::read(path).map_err(|error| format!("读取 PNG 失败：{error}"))?;
-    match copy_image_and_file_to_clipboard(&png, path) {
-        Ok(()) => Ok(()),
-        Err(dual_error) => copy_png_to_clipboard(cx, &png).map_err(|image_error| {
-            format!("双格式失败（{dual_error}）；仅图片也失败（{image_error}）")
-        }),
-    }
-}
-
 /// 把 PNG 图片字节转换为 Windows DIB 字节（BITMAPINFOHEADER + 自下而上 BGRA）。
 ///
 /// Word / 画图等优先认 CF_DIB，直接给 PNG（`PNG` 注册格式）部分旧程序认不出，
@@ -102,6 +91,12 @@ pub fn copy_saved_png(cx: &mut rgpui::App, path: &Path) -> Result<(), String> {
 fn png_to_dib_bytes(png: &[u8]) -> Option<Vec<u8>> {
     // 先解码为 RGBA，再逐像素转 BGRA 并上下翻转。
     let img = image::load_from_memory(png).ok()?.into_rgba8();
+    rgba_to_dib_bytes(&img)
+}
+
+/// 从已有像素生成 DIB，避免截图刚编码成 PNG 又立刻解码。
+#[cfg(any(target_os = "windows", test))]
+fn rgba_to_dib_bytes(img: &RgbaImage) -> Option<Vec<u8>> {
     let (w, h) = (img.width(), img.height());
     if w == 0 || h == 0 {
         return None;
@@ -164,6 +159,42 @@ fn hdrop_bytes(path: &Path) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// 往剪贴板写字节，成功移交系统所有权，失败释放内存。
+#[cfg(target_os = "windows")]
+fn set_clipboard_bytes(data: &[u8], format: u32) -> Result<(), String> {
+    use windows::Win32::{
+        // windows 0.62 把 GlobalFree 放在 Foundation，分配 / 加锁仍在 System::Memory。
+        Foundation::{GlobalFree, HANDLE},
+        System::{
+            DataExchange::SetClipboardData,
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
+        },
+    };
+    if data.is_empty() {
+        return Err(tr("export.empty_clip"));
+    }
+    unsafe {
+        let global = GlobalAlloc(GMEM_MOVEABLE, data.len())
+            .map_err(|e| tr_fmt("export.alloc_fail", &[("e", &format!("{e:?}"))]))?;
+        let ptr = GlobalLock(global);
+        if ptr.is_null() {
+            // 加锁失败不会再有人接管这块内存，就地释放，避免泄漏。
+            let _ = GlobalFree(Some(global));
+            return Err(tr("export.lock_fail"));
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+        let _ = GlobalUnlock(global);
+        if let Err(error) = SetClipboardData(format, Some(HANDLE(global.0))) {
+            // 写入失败时内存仍归本进程，必须显式释放。
+            let _ = GlobalFree(Some(global));
+            return Err(tr_fmt("export.write_fail", &[("e", &format!("{error:?}"))]));
+        }
+        // HGLOBAL 是纯句柄（Copy 类型，无 RAII）：成功后内存归系统所有，
+        // 此处不再释放，函数返回即完成所有权移交。
+        Ok(())
+    }
+}
+
 /// 把 PNG 图片与图片文件同时写入剪贴板（Windows）：Word 等粘贴为图片，资源管理器粘贴为文件。
 ///
 /// rgpui 内建 `write_to_clipboard` 在 Windows 后端会忽略文件条目，
@@ -171,6 +202,18 @@ fn hdrop_bytes(path: &Path) -> Option<Vec<u8>> {
 /// 同时写入 PNG / DIB / HDROP 三种格式，两类粘贴目标各取所需。
 #[cfg(target_os = "windows")]
 pub fn copy_image_and_file_to_clipboard(png: &[u8], path: &Path) -> Result<(), String> {
+    write_image_clipboard(png, path, png_to_dib_bytes(png))
+}
+
+/// 截图专用复制入口，复用内存中的 RGBA，保留 PNG、DIB 与文件三种格式。
+#[cfg(target_os = "windows")]
+pub fn copy_capture_to_clipboard(png: &[u8], img: &RgbaImage, path: &Path) -> Result<(), String> {
+    write_image_clipboard(png, path, rgba_to_dib_bytes(img))
+}
+
+/// 同一剪贴板会话写入所有格式，沿用原有重试和内存所有权处理。
+#[cfg(target_os = "windows")]
+fn write_image_clipboard(png: &[u8], path: &Path, dib: Option<Vec<u8>>) -> Result<(), String> {
     use windows::Win32::System::{
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW},
         Ole::{CF_DIB, CF_HDROP},
@@ -183,43 +226,7 @@ pub fn copy_image_and_file_to_clipboard(png: &[u8], path: &Path) -> Result<(), S
         return Err(tr("export.no_clip_file"));
     }
     // DIB 可选：生成失败仍可继续（PNG 格式多数程序也认），HDROP 必须成功。
-    let dib = png_to_dib_bytes(png);
     let hdrop = hdrop_bytes(path).ok_or_else(|| tr("export.hdrop_fail"))?;
-
-    // 往剪贴板写一段字节（内存所有权成功后移交系统，失败才释放）。
-    fn set_bytes(data: &[u8], format: u32) -> Result<(), String> {
-        use windows::Win32::{
-            // windows 0.62 把 GlobalFree 放在 Foundation，分配 / 加锁仍在 System::Memory。
-            Foundation::{GlobalFree, HANDLE},
-            System::{
-                DataExchange::SetClipboardData,
-                Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
-            },
-        };
-        if data.is_empty() {
-            return Err(tr("export.empty_clip"));
-        }
-        unsafe {
-            let global = GlobalAlloc(GMEM_MOVEABLE, data.len())
-                .map_err(|e| tr_fmt("export.alloc_fail", &[("e", &format!("{e:?}"))]))?;
-            let ptr = GlobalLock(global);
-            if ptr.is_null() {
-                // 加锁失败不会再有人接管这块内存，就地释放，避免泄漏。
-                let _ = GlobalFree(Some(global));
-                return Err(tr("export.lock_fail"));
-            }
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
-            let _ = GlobalUnlock(global);
-            if let Err(error) = SetClipboardData(format, Some(HANDLE(global.0))) {
-                // 写入失败时内存仍归本进程，必须显式释放。
-                let _ = GlobalFree(Some(global));
-                return Err(tr_fmt("export.write_fail", &[("e", &format!("{error:?}"))]));
-            }
-            // HGLOBAL 是纯句柄（Copy 类型，无 RAII）：成功后内存归系统所有，
-            // 此处不再释放，函数返回即完成所有权移交。
-            Ok(())
-        }
-    }
 
     // 剪贴板可能被其他程序短暂占用，重试几次。
     let mut opened = false;
@@ -243,16 +250,19 @@ pub fn copy_image_and_file_to_clipboard(png: &[u8], path: &Path) -> Result<(), S
         if png_format == 0 {
             return Err(tr("export.reg_fail"));
         }
-        set_bytes(png, png_format)?;
+        set_clipboard_bytes(png, png_format)?;
         // DIB：画图等旧程序认它，失败不阻断（PNG 已写入）。
         if let Some(dib) = &dib {
-            let _ = set_bytes(dib, CF_DIB.0 as u32);
+            let _ = set_clipboard_bytes(dib, CF_DIB.0 as u32);
         }
         // HDROP：资源管理器认它，直接粘贴为文件。
-        set_bytes(&hdrop, CF_HDROP.0 as u32)?;
+        set_clipboard_bytes(&hdrop, CF_HDROP.0 as u32)?;
         Ok(())
     })();
     let _ = unsafe { CloseClipboard() };
+    if result.is_ok() {
+        record_self_clipboard_seq();
+    }
     result
 }
 
@@ -262,41 +272,47 @@ pub fn copy_image_and_file_to_clipboard(_png: &[u8], _path: &Path) -> Result<(),
     Err(tr("export.unsupported"))
 }
 
+/// 非 Windows 复用既有格式复制与回退行为。
+#[cfg(not(target_os = "windows"))]
+pub fn copy_capture_to_clipboard(png: &[u8], _img: &RgbaImage, path: &Path) -> Result<(), String> {
+    copy_image_and_file_to_clipboard(png, path)
+}
+
 /// 把图片文件作为“文件项”写入系统剪贴板，便于在资源管理器目录中直接粘贴。
 ///
 /// # 参数
 /// - `path`: 已存在的 PNG 文件路径。
 #[cfg(target_os = "windows")]
 pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    use windows::Win32::System::{
+        DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard},
+        Ole::CF_HDROP,
+    };
     if !path.is_file() {
         return Err(tr("export.no_clip_file"));
     }
-
-    // Windows 资源管理器需要 CF_HDROP 文件列表；PowerShell 的 Set-Clipboard -LiteralPath
-    // 会按系统格式写入文件项，比普通文本路径更适合直接粘贴成新文件。
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "Set-Clipboard -LiteralPath $args[0]",
-        ])
-        .arg(path.as_os_str())
-        .output()
-        .map_err(|err| tr_fmt("export.sys_fail", &[("err", &err.to_string())]))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            Err(tr("export.file_fail"))
-        } else {
-            Err(stderr)
+    let data = hdrop_bytes(path).ok_or_else(|| tr("export.hdrop_fail"))?;
+    let mut opened = false;
+    for _ in 0..8 {
+        if unsafe { OpenClipboard(None) }.is_ok() {
+            opened = true;
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    if !opened {
+        return Err(tr("export.open_fail"));
+    }
+    let result = (|| {
+        unsafe { EmptyClipboard() }
+            .map_err(|e| tr_fmt("export.empty_fail", &[("e", &format!("{e:?}"))]))?;
+        set_clipboard_bytes(&data, CF_HDROP.0 as u32)
+    })();
+    let _ = unsafe { CloseClipboard() };
+    if result.is_ok() {
+        record_self_clipboard_seq();
+    }
+    result
 }
 
 /// 把图片文件作为“文件项”写入系统剪贴板，非 Windows 平台暂时回退为不支持。
@@ -306,6 +322,201 @@ pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 pub fn copy_file_to_clipboard(_path: &Path) -> Result<(), String> {
     Err(tr("export.unsupported"))
+}
+
+/// 记录本进程最近一次写入系统剪贴板的序列号，避免把自身刚复制的截图重复当成外部复制图。
+#[cfg(target_os = "windows")]
+static LAST_SELF_CLIPBOARD_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_os = "windows")]
+fn record_self_clipboard_seq() {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    LAST_SELF_CLIPBOARD_SEQ.store(seq, Ordering::Relaxed);
+}
+
+/// 从系统剪贴板读取用户复制的图片文件（`CF_HDROP`）或图像数据（`PNG` / `CF_DIB`）。
+///
+/// - `force = false`：仅当剪贴板序列号不同于本进程最近写入时才读取，避免覆盖刚截完的预览状态。
+/// - `force = true`：无视序列号直接尝试读取当前剪贴板中的图片（如 `Ctrl+V` 或无最近记录时）。
+#[cfg(target_os = "windows")]
+pub fn read_image_from_clipboard(force: bool) -> Option<PathBuf> {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::{
+        Foundation::HGLOBAL,
+        System::{
+            DataExchange::{
+                CloseClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
+                RegisterClipboardFormatW,
+            },
+            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+            Ole::{CF_DIB, CF_HDROP},
+        },
+    };
+
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    if !force && seq != 0 && seq == LAST_SELF_CLIPBOARD_SEQ.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    if unsafe { OpenClipboard(None) }.is_err() {
+        return None;
+    }
+
+    // 读取指定剪贴板格式的原始字节，确保锁在返回前解锁。
+    let read_format = |fmt: u32| -> Option<Vec<u8>> {
+        let handle = unsafe { GetClipboardData(fmt) }.ok()?;
+        let hglobal = HGLOBAL(handle.0);
+        let size = unsafe { GlobalSize(hglobal) };
+        if size == 0 {
+            return None;
+        }
+        let ptr = unsafe { GlobalLock(hglobal) };
+        if ptr.is_null() {
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
+        let bytes = slice.to_vec();
+        let _ = unsafe { GlobalUnlock(hglobal) };
+        Some(bytes)
+    };
+
+    let hdrop_bytes = read_format(CF_HDROP.0 as u32);
+    let png_fmt = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
+    let png_bytes_data = (png_fmt != 0).then(|| read_format(png_fmt)).flatten();
+    let dib_bytes = read_format(CF_DIB.0 as u32);
+
+    let _ = unsafe { CloseClipboard() };
+
+    // 1. 优先识别资源管理器复制的图片文件（CF_HDROP）。
+    if let Some(bytes) = hdrop_bytes
+        && let Some(path) = parse_hdrop_first_path(&bytes)
+        && crate::viewer::preview_from_path(&path).is_some()
+    {
+        return Some(path);
+    }
+
+    // 2. 识别剪贴板原始 PNG 数据。
+    if let Some(bytes) = png_bytes_data
+        && let Ok(img) = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+    {
+        return write_clipboard_temp_png(seq, &img.to_rgba8());
+    }
+
+    // 3. 识别传统位图 DIB（24 / 32 bpp）。
+    if let Some(bytes) = dib_bytes
+        && let Some(rgba) = decode_dib_to_rgba(&bytes)
+    {
+        return write_clipboard_temp_png(seq, &rgba);
+    }
+
+    None
+}
+
+/// 非 Windows 平台暂不从系统剪贴板读取图片文件。
+#[cfg(not(target_os = "windows"))]
+pub fn read_image_from_clipboard(_force: bool) -> Option<PathBuf> {
+    None
+}
+
+/// 解析 `DROPFILES` 结构并提取第一个文件路径（支持 UTF-16LE 与本地单字节）。
+#[cfg(target_os = "windows")]
+fn parse_hdrop_first_path(bytes: &[u8]) -> Option<PathBuf> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    let offset = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let f_wide = u32::from_le_bytes(bytes[16..20].try_into().ok()?) != 0;
+    if offset >= bytes.len() {
+        return None;
+    }
+    let payload = &bytes[offset..];
+    if f_wide {
+        let mut units = Vec::new();
+        for chunk in payload.as_chunks::<2>().0 {
+            let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if u == 0 {
+                break;
+            }
+            units.push(u);
+        }
+        if units.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(String::from_utf16_lossy(&units)))
+    } else {
+        let end = payload
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(payload.len());
+        if end == 0 {
+            return None;
+        }
+        Some(PathBuf::from(
+            String::from_utf8_lossy(&payload[..end]).into_owned(),
+        ))
+    }
+}
+
+/// 将常见 24 / 32 位无压缩 `CF_DIB` 解码为 RGBA 图像。
+#[cfg(target_os = "windows")]
+fn decode_dib_to_rgba(bytes: &[u8]) -> Option<RgbaImage> {
+    if bytes.len() < 40 {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    if header_size < 40 || bytes.len() < header_size {
+        return None;
+    }
+    let w = i32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let h_raw = i32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let bpp = u16::from_le_bytes(bytes[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+    if w <= 0 || h_raw == 0 || (compression != 0 && compression != 3) || (bpp != 24 && bpp != 32) {
+        return None;
+    }
+    let w_u = w as u32;
+    let h_u = h_raw.unsigned_abs();
+    let top_down = h_raw < 0;
+    let mask_extra = if compression == 3 && header_size == 40 {
+        12
+    } else {
+        0
+    };
+    let pixel_offset = header_size + mask_extra;
+    let stride = (w_u as usize * bpp as usize).div_ceil(32) * 4;
+    if bytes.len() < pixel_offset + stride * h_u as usize {
+        return None;
+    }
+    let pixels = &bytes[pixel_offset..];
+    let mut out = RgbaImage::new(w_u, h_u);
+    for y in 0..h_u {
+        let src_y = if top_down { y } else { h_u - 1 - y };
+        let row = &pixels[src_y as usize * stride..];
+        for x in 0..w_u {
+            match bpp {
+                32 => {
+                    let i = x as usize * 4;
+                    out.put_pixel(x, y, image::Rgba([row[i + 2], row[i + 1], row[i], 255]));
+                }
+                24 => {
+                    let i = x as usize * 3;
+                    out.put_pixel(x, y, image::Rgba([row[i + 2], row[i + 1], row[i], 255]));
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(out)
+}
+
+/// 将剪贴板图像落盘为临时 PNG 供预览标注窗口加载。
+#[cfg(target_os = "windows")]
+fn write_clipboard_temp_png(seq: u32, rgba: &RgbaImage) -> Option<PathBuf> {
+    let path = std::env::temp_dir().join(format!("rivix-clip-{seq}.png"));
+    rgba.save_with_format(&path, image::ImageFormat::Png).ok()?;
+    Some(path)
 }
 
 /// 加载系统字体（供文字烧录），按平台常见中文字体依次尝试。
@@ -347,6 +558,146 @@ pub fn load_system_font() -> Option<FontVec> {
     None
 }
 
+/// 枚举当前系统已安装的常规字体列表（名称 + 字体文件路径），只扫描一次并缓存。
+pub fn system_font_list() -> &'static [(String, PathBuf)] {
+    use std::sync::OnceLock;
+    static FONTS: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        #[cfg(target_os = "windows")]
+        {
+            collect_windows_fonts()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Vec::new()
+        }
+    })
+}
+
+/// 扫描 Windows 注册表（系统级 + 当前用户级）中的常规 TrueType/OpenType 字体。
+#[cfg(target_os = "windows")]
+fn collect_windows_fonts() -> Vec<(String, PathBuf)> {
+    use std::collections::BTreeMap;
+    use windows::{
+        Win32::{
+            Foundation::ERROR_NO_MORE_ITEMS,
+            System::Registry::{
+                HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RegCloseKey,
+                RegEnumValueW, RegOpenKeyExW,
+            },
+        },
+        core::w,
+    };
+
+    let mut map: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let fonts_dir = PathBuf::from("C:\\Windows\\Fonts");
+
+    let mut read_hive = |root: HKEY| {
+        let mut hkey = HKEY::default();
+        let subkey = w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+        if unsafe { RegOpenKeyExW(root, subkey, Some(0), KEY_READ, &mut hkey) }.is_err() {
+            return;
+        }
+        let mut idx = 0u32;
+        loop {
+            let mut name_buf = [0u16; 260];
+            let mut name_len = name_buf.len() as u32;
+            let mut kind = 0u32;
+            let mut data_buf = [0u8; 520];
+            let mut data_len = data_buf.len() as u32;
+            let status = unsafe {
+                RegEnumValueW(
+                    hkey,
+                    idx,
+                    Some(windows::core::PWSTR(name_buf.as_mut_ptr())),
+                    &mut name_len,
+                    None,
+                    Some(&mut kind),
+                    Some(data_buf.as_mut_ptr()),
+                    Some(&mut data_len),
+                )
+            };
+            idx += 1;
+            if status == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            if status.is_err() || kind != REG_SZ.0 {
+                continue;
+            }
+            let raw_name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+            // 仅保留 TrueType / OpenType 字体，过滤 Bold/Italic 变体以免列表过长。
+            if !(raw_name.contains("(TrueType)") || raw_name.contains("(OpenType)")) {
+                continue;
+            }
+            let clean = raw_name
+                .replace(" (TrueType)", "")
+                .replace(" (OpenType)", "");
+            let primary = clean.split(" & ").next().unwrap_or(&clean).trim();
+            if primary.is_empty()
+                || primary.ends_with(" Bold")
+                || primary.ends_with(" Italic")
+                || primary.ends_with(" Light")
+                || primary.ends_with(" Semibold")
+            {
+                continue;
+            }
+            let u16_slice: Vec<u16> = data_buf[..data_len as usize]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .take_while(|&u| u != 0)
+                .collect();
+            let raw_path = String::from_utf16_lossy(&u16_slice);
+            let p = PathBuf::from(raw_path.trim());
+            let full_path = if p.is_absolute() {
+                p
+            } else {
+                fonts_dir.join(p)
+            };
+            if full_path.is_file() {
+                map.entry(primary.to_string()).or_insert(full_path);
+            }
+        }
+        let _ = unsafe { RegCloseKey(hkey) };
+    };
+
+    read_hive(HKEY_LOCAL_MACHINE);
+    read_hive(HKEY_CURRENT_USER);
+    map.into_iter().collect()
+}
+
+/// 按指定字体家族名称加载系统字体文件；未指定或找不到时回退到默认系统字体。
+pub fn load_font_for_family(family: Option<&str>) -> Option<FontVec> {
+    if let Some(name) = family {
+        if let Some((_, path)) = system_font_list().iter().find(|(n, _)| n == name)
+            && let Ok(data) = std::fs::read(path)
+            && let Ok(font) = FontVec::try_from_vec_and_index(data, 0)
+        {
+            return Some(font);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let fallback = match name {
+                "Microsoft YaHei" => Some("C:\\Windows\\Fonts\\msyh.ttc"),
+                "SimHei" => Some("C:\\Windows\\Fonts\\simhei.ttf"),
+                "SimSun" => Some("C:\\Windows\\Fonts\\simsun.ttc"),
+                "KaiTi" => Some("C:\\Windows\\Fonts\\simkai.ttf"),
+                "Arial" => Some("C:\\Windows\\Fonts\\arial.ttf"),
+                "Consolas" => Some("C:\\Windows\\Fonts\\consola.ttf"),
+                _ => None,
+            };
+            if let Some(p) = fallback
+                && let Ok(data) = std::fs::read(p)
+                && let Ok(font) = FontVec::try_from_vec_and_index(data, 0)
+            {
+                return Some(font);
+            }
+        }
+    }
+    load_system_font()
+}
+
 /// 绘制单个标注（坐标从全图换算到裁剪局部坐标）。
 fn draw_shape(
     img: &mut RgbaImage,
@@ -363,21 +714,76 @@ fn draw_shape(
             let local_pts: Vec<(f32, f32)> = pts.iter().map(|(x, y)| local(*x, *y)).collect();
             stroke_polyline(img, &local_pts, *width, *color, clip);
         }
+        Shape::Polygon {
+            pts,
+            color,
+            width,
+            fill,
+            has_stroke,
+        } => {
+            let mut local_pts: Vec<(f32, f32)> = pts.iter().map(|(x, y)| local(*x, *y)).collect();
+            if let Some(fill_color) = *fill {
+                fill_polygon(img, &local_pts, fill_color, clip);
+            }
+            if *has_stroke {
+                if let Some(&first) = local_pts.first() {
+                    local_pts.push(first);
+                }
+                stroke_polyline(img, &local_pts, *width, *color, clip);
+            }
+        }
         Shape::Highlighter { pts, color, width } => {
             // 荧光笔：加粗 + 强制半透明，模拟记号笔覆盖效果。
             let translucent = AnnoColor(color.0, color.1, color.2, 110);
             let local_pts: Vec<(f32, f32)> = pts.iter().map(|(x, y)| local(*x, *y)).collect();
             stroke_polyline(img, &local_pts, width * 3.0, translucent, clip);
         }
-        Shape::Rect { rect, color, width } => {
+        Shape::Rect {
+            rect,
+            color,
+            width,
+            fill,
+            has_stroke,
+            radius,
+        } => {
             let (x, y) = local(rect.x, rect.y);
             let local_rect = PixelRect::new(x, y, rect.w, rect.h);
-            rect_border(img, local_rect, *width, *color, clip);
+            if let Some(fill_color) = *fill {
+                fill_rounded_rect(img, local_rect, *radius, fill_color, clip);
+            }
+            if *has_stroke {
+                rounded_rect_border(img, local_rect, *radius, *width, *color, clip);
+            }
         }
-        Shape::Ellipse { rect, color, width } => {
+        Shape::Ellipse {
+            rect,
+            color,
+            width,
+            fill,
+            has_stroke,
+        } => {
             let (x, y) = local(rect.x, rect.y);
             let local_rect = PixelRect::new(x, y, rect.w, rect.h);
-            ellipse_border(img, local_rect, *width, *color, clip);
+            if let Some(fill_color) = *fill {
+                fill_ellipse(img, local_rect, fill_color, clip);
+            }
+            if *has_stroke {
+                ellipse_border(img, local_rect, *width, *color, clip);
+            }
+        }
+        Shape::Line {
+            from,
+            to,
+            color,
+            width,
+        } => {
+            stroke_polyline(
+                img,
+                &[local(from.0, from.1), local(to.0, to.1)],
+                *width,
+                *color,
+                clip,
+            );
         }
         Shape::Arrow {
             from,
@@ -400,21 +806,49 @@ fn draw_shape(
             size,
             bg,
             bg_color,
+            max_w,
+            font_family,
+            stroke_color,
+            stroke_width,
         } => {
+            let custom_font = font_family
+                .as_deref()
+                .and_then(|f| load_font_for_family(Some(f)));
+            let active_font = custom_font.as_ref().or(font.as_ref());
             // 无字体时跳过，保证“至少能导出底图 + 图形”。
-            if let Some(font) = font {
-                // 有底色时用该条自己的底色（统一半透明），无底色传 None。
+            if let Some(font) = active_font {
                 let bg_fill = if *bg { Some(*bg_color) } else { None };
-                draw_text(
-                    img,
-                    font,
-                    local(pos.0, pos.1),
-                    content,
-                    *color,
-                    *size,
-                    bg_fill,
-                    clip,
-                );
+                let text_stroke = stroke_color.map(|sc| (sc, *stroke_width));
+                let (x, y) = local(pos.0, pos.1);
+                if let Some(box_w) = *max_w {
+                    let lines = wrap_lines_with_font(font, content, *size, box_w);
+                    let line_step = *size * crate::shapes::TEXT_LINE_HEIGHT;
+                    for (idx, line) in lines.iter().enumerate() {
+                        draw_text(
+                            img,
+                            font,
+                            (x, y + idx as f32 * line_step),
+                            line,
+                            *color,
+                            *size,
+                            bg_fill,
+                            text_stroke,
+                            clip,
+                        );
+                    }
+                } else {
+                    draw_text(
+                        img,
+                        font,
+                        (x, y),
+                        content,
+                        *color,
+                        *size,
+                        bg_fill,
+                        text_stroke,
+                        clip,
+                    );
+                }
             }
         }
     }
@@ -544,6 +978,177 @@ fn fill_rect(
     }
 }
 
+/// 实心圆角矩形填充：圆角半径自动裁剪到宽高一半以内。
+fn fill_rounded_rect(
+    img: &mut RgbaImage,
+    rect: PixelRect,
+    radius: f32,
+    color: AnnoColor,
+    clip: &PixelRect,
+) {
+    let r = radius.max(0.0).min(rect.w * 0.5).min(rect.h * 0.5);
+    if r <= 0.5 {
+        fill_rect(img, rect.x, rect.y, rect.w, rect.h, color, clip);
+        return;
+    }
+    let (x0, y0) = (rect.x.floor() as i32, rect.y.floor() as i32);
+    let (x1, y1) = (
+        (rect.x + rect.w).ceil() as i32,
+        (rect.y + rect.h).ceil() as i32,
+    );
+    let r2 = r * r;
+    for yy in y0..y1 {
+        let py = yy as f32 + 0.5;
+        let dy = if py < rect.y + r {
+            rect.y + r - py
+        } else if py > rect.y + rect.h - r {
+            py - (rect.y + rect.h - r)
+        } else {
+            0.0
+        };
+        for xx in x0..x1 {
+            let px = xx as f32 + 0.5;
+            let dx = if px < rect.x + r {
+                rect.x + r - px
+            } else if px > rect.x + rect.w - r {
+                px - (rect.x + rect.w - r)
+            } else {
+                0.0
+            };
+            if dx * dx + dy * dy <= r2 {
+                blend_px(img, xx, yy, color, clip);
+            }
+        }
+    }
+}
+
+/// 圆角矩形描边：四条直边 + 四个四分之一圆弧用圆印章平滑描绘。
+fn rounded_rect_border(
+    img: &mut RgbaImage,
+    rect: PixelRect,
+    radius: f32,
+    width: f32,
+    color: AnnoColor,
+    clip: &PixelRect,
+) {
+    let r = radius.max(0.0).min(rect.w * 0.5).min(rect.h * 0.5);
+    if r <= 0.5 {
+        rect_border(img, rect, width, color, clip);
+        return;
+    }
+    let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+    let stamp_r = width / 2.0;
+    // 四条直边。
+    stroke_polyline(img, &[(x + r, y), (x + w - r, y)], width, color, clip);
+    stroke_polyline(
+        img,
+        &[(x + w, y + r), (x + w, y + h - r)],
+        width,
+        color,
+        clip,
+    );
+    stroke_polyline(
+        img,
+        &[(x + w - r, y + h), (x + r, y + h)],
+        width,
+        color,
+        clip,
+    );
+    stroke_polyline(img, &[(x, y + h - r), (x, y + r)], width, color, clip);
+    // 四个圆角弧。
+    let corners = [
+        (
+            x + r,
+            y + r,
+            std::f32::consts::PI,
+            std::f32::consts::FRAC_PI_2 * 3.0,
+        ),
+        (x + w - r, y + r, -std::f32::consts::FRAC_PI_2, 0.0),
+        (x + w - r, y + h - r, 0.0, std::f32::consts::FRAC_PI_2),
+        (
+            x + r,
+            y + h - r,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+        ),
+    ];
+    let steps = (r * 2.0).ceil().max(10.0) as usize;
+    for (cx, cy, a0, a1) in corners {
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let theta = a0 + (a1 - a0) * t;
+            stamp(
+                img,
+                cx + r * theta.cos(),
+                cy + r * theta.sin(),
+                stamp_r,
+                color,
+                clip,
+            );
+        }
+    }
+}
+
+/// 实心椭圆填充。
+fn fill_ellipse(img: &mut RgbaImage, rect: PixelRect, color: AnnoColor, clip: &PixelRect) {
+    let (rx, ry) = (rect.w * 0.5, rect.h * 0.5);
+    if rx <= 0.5 || ry <= 0.5 {
+        return;
+    }
+    let (cx, cy) = (rect.x + rx, rect.y + ry);
+    let (x0, y0) = (rect.x.floor() as i32, rect.y.floor() as i32);
+    let (x1, y1) = (
+        (rect.x + rect.w).ceil() as i32,
+        (rect.y + rect.h).ceil() as i32,
+    );
+    for yy in y0..y1 {
+        let ny = (yy as f32 + 0.5 - cy) / ry;
+        for xx in x0..x1 {
+            let nx = (xx as f32 + 0.5 - cx) / rx;
+            if nx * nx + ny * ny <= 1.0 {
+                blend_px(img, xx, yy, color, clip);
+            }
+        }
+    }
+}
+
+/// 实心多边形填充（扫描线奇偶规则）。
+fn fill_polygon(img: &mut RgbaImage, pts: &[(f32, f32)], color: AnnoColor, clip: &PixelRect) {
+    if pts.len() < 3 {
+        return;
+    }
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
+    for &(_, y) in pts {
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let y0 = min_y.floor() as i32;
+    let y1 = max_y.ceil() as i32;
+    let n = pts.len();
+    let mut xs = Vec::with_capacity(n);
+    for yy in y0..=y1 {
+        let py = yy as f32 + 0.5;
+        xs.clear();
+        for i in 0..n {
+            let (x1, y1) = pts[i];
+            let (x2, y2) = pts[(i + 1) % n];
+            if (y1 <= py && y2 > py) || (y2 <= py && y1 > py) {
+                let x = x1 + (py - y1) * (x2 - x1) / (y2 - y1);
+                xs.push(x);
+            }
+        }
+        xs.sort_by(|a, b| a.total_cmp(b));
+        for pair in xs.as_chunks::<2>().0 {
+            let sx = pair[0].floor() as i32;
+            let ex = pair[1].ceil() as i32;
+            for xx in sx..ex {
+                blend_px(img, xx, yy, color, clip);
+            }
+        }
+    }
+}
+
 /// 椭圆边框：参数方程取点盖印章。
 fn ellipse_border(
     img: &mut RgbaImage,
@@ -650,20 +1255,44 @@ fn in_clip(x: i32, y: i32, clip: &PixelRect) -> bool {
         && y < (clip.y + clip.h) as i32
 }
 
-/// 量一行文本在指定字号下的 advance 总宽（OCR 原位 overlay 按框宽拟合字号用）。
-///
-/// 与下方 `draw_text` 同一套度量（同 scale 下的 `h_advance` 求和），保证量出来即画出来。
-pub fn measure_text_width(font: &FontVec, content: &str, size: f32) -> f32 {
-    let scale = PxScale::from(size.max(8.0));
-    let scaled = font.as_scaled(scale);
-    content
-        .chars()
-        .map(|ch| scaled.h_advance(scaled.glyph_id(ch)))
-        .sum()
+/// UI 字号以 em 像素计，ab_glyph 则按字体总高度缩放，转换后避免保存文字变小。
+fn text_pixel_scale(font: &FontVec, size: f32) -> PxScale {
+    let size = size.max(8.0);
+    let scaled = font
+        .units_per_em()
+        .filter(|em| *em > 0.0)
+        .map(|em| size * font.height_unscaled() / em)
+        .unwrap_or(size);
+    PxScale::from(scaled)
 }
 
-/// 单行文字绘制：逐字形取位图拼排（中文按字推进，无复杂塑形，截图标注够用）。
-// 参数多为烧录必需（位置 / 内容 / 颜色 / 字号 / 底色缺一不可），此处允许超限。
+/// 按指定字体测量并把文本按 `max_w` 折行拆分为多行（支持 `\n` 显式换行）。
+fn wrap_lines_with_font(font: &FontVec, content: &str, size: f32, max_w: f32) -> Vec<String> {
+    let scale = text_pixel_scale(font, size);
+    let scaled = font.as_scaled(scale);
+    let mut lines = Vec::new();
+    for para in content.split('\n') {
+        let mut cur = String::new();
+        let mut cur_w = 0.0f32;
+        for ch in para.chars() {
+            let cw = scaled.h_advance(scaled.glyph_id(ch));
+            if !cur.is_empty() && cur_w + cw > max_w {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0.0;
+            }
+            cur.push(ch);
+            cur_w += cw;
+        }
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// 单行文字绘制：逐字形取位图拼排（支持底色与文字背后的圆角描边）。
+// 参数多为烧录必需（位置 / 内容 / 颜色 / 字号 / 底色 / 描边缺一不可），此处允许超限。
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     img: &mut RgbaImage,
@@ -673,17 +1302,19 @@ fn draw_text(
     color: AnnoColor,
     size: f32,
     bg: Option<AnnoColor>,
+    stroke: Option<(AnnoColor, f32)>,
     clip: &PixelRect,
 ) {
     let (x, y) = pos;
-    let scale = PxScale::from(size.max(8.0));
+    let scale = text_pixel_scale(font, size);
     let scaled = font.as_scaled(scale);
     // 先估算整行宽度（底色矩形用），与下方逐字推进共用同一 advance。
     let text_w: f32 = content
         .chars()
         .map(|ch| scaled.h_advance(scaled.glyph_id(ch)))
         .sum();
-    let text_h = scaled.ascent() - scaled.descent();
+    let glyph_h = scaled.ascent() - scaled.descent();
+    let text_h = size * crate::shapes::TEXT_LINE_HEIGHT;
     // 带底色时先铺该条自己的底色（统一半透明），内边距随字号缩放。
     // 预览 div 也有 px_2 / py_1 内边距，这里按比例还原，保证所见即所得。
     if let Some(bg_color) = bg {
@@ -699,9 +1330,69 @@ fn draw_text(
             clip,
         );
     }
-    // 笔头从行首开始，基线 = 起始行 + 上伸部。
+    let baseline = y + (text_h - glyph_h) * 0.5 + scaled.ascent();
+
+    // 若启用描边：先对所有字形位图做圆形膨胀（圆角描边），统一画在文字下方。
+    if let Some((stroke_color, stroke_w)) = stroke
+        && stroke_w > 0.1
+    {
+        let r = stroke_w.ceil() as i32;
+        let r2 = stroke_w * stroke_w;
+        let bx0 = (x - stroke_w - 4.0).floor() as i32;
+        let bx1 = (x + text_w + stroke_w + 16.0).ceil() as i32;
+        let by0 = (y - stroke_w - 8.0).floor() as i32;
+        let by1 = (y + text_h + stroke_w + 8.0).ceil() as i32;
+        let bw = (bx1 - bx0).max(1) as usize;
+        let bh = (by1 - by0).max(1) as usize;
+        let mut cov = vec![0.0f32; bw * bh];
+        let mut caret_x = x;
+        for ch in content.chars() {
+            let glyph_id = scaled.glyph_id(ch);
+            let glyph = glyph_id.with_scale_and_position(scale, point(caret_x, baseline));
+            if let Some(outlined) = scaled.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                outlined.draw(|gx, gy, v| {
+                    if v <= 0.0 {
+                        return;
+                    }
+                    let px = bounds.min.x as i32 + gx as i32;
+                    let py = bounds.min.y as i32 + gy as i32;
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            if (dx * dx + dy * dy) as f32 <= r2 {
+                                let tx = px + dx - bx0;
+                                let ty = py + dy - by0;
+                                if tx >= 0 && ty >= 0 && (tx as usize) < bw && (ty as usize) < bh {
+                                    let idx = ty as usize * bw + tx as usize;
+                                    if v > cov[idx] {
+                                        cov[idx] = v;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            caret_x += scaled.h_advance(glyph_id);
+        }
+        for ty in 0..bh {
+            for tx in 0..bw {
+                let v = cov[ty * bw + tx];
+                if v > 0.0 {
+                    let faded = AnnoColor(
+                        stroke_color.0,
+                        stroke_color.1,
+                        stroke_color.2,
+                        (stroke_color.3 as f32 * v) as u8,
+                    );
+                    blend_px(img, bx0 + tx as i32, by0 + ty as i32, faded, clip);
+                }
+            }
+        }
+    }
+
+    // 笔头从行首开始，绘制文字填充在描边之上。
     let mut caret_x = x;
-    let baseline = y + scaled.ascent();
     for ch in content.chars() {
         let glyph_id = scaled.glyph_id(ch);
         // 字形先定位再勾边，`OutlinedGlyph` 自带像素位图。
@@ -724,16 +1415,32 @@ fn draw_text(
     }
 }
 
-/// 读取图片文件为 RGBA（导出入口）。
-pub fn load_rgba(path: &std::path::Path) -> Option<RgbaImage> {
-    image::open(path).ok().map(|img| img.to_rgba8())
-}
-
 #[cfg(test)]
 mod tests {
     //! 导出模块单测：用合成底图覆盖全部标注类型，保证栅格化不 panic。
 
     use super::*;
+
+    /// 快速 PNG 与直接 DIB 路径必须保持像素、通道和上下方向完全一致。
+    /// Windows 系统中文字体的全角字 advance 应等于 UI 的 em 字号。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn exported_text_uses_ui_pixel_font_size() {
+        let font = load_system_font().expect("Windows system font required");
+        let scaled = font.as_scaled(text_pixel_scale(&font, 28.0));
+        let glyph = scaled.glyph_id('测');
+        assert_ne!(glyph.0, 0);
+        assert!((scaled.h_advance(glyph) - 28.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn fast_clipboard_preserves_pixels() {
+        let image =
+            RgbaImage::from_fn(7, 5, |x, y| Rgba([(x * 31) as u8, (y * 47) as u8, 93, 255]));
+        let png = png_bytes(&image).unwrap();
+        assert_eq!(image::load_from_memory(&png).unwrap().into_rgba8(), image);
+        assert_eq!(rgba_to_dib_bytes(&image), png_to_dib_bytes(&png));
+    }
 
     /// 全类型标注导出冒烟测试（尺寸与 PNG 编码断言）。
     #[test]
@@ -756,11 +1463,16 @@ mod tests {
                 rect: PixelRect::new(15.0, 15.0, 60.0, 40.0),
                 color: AnnoColor::GREEN,
                 width: 2.0,
+                fill: None,
+                has_stroke: true,
+                radius: 4.0,
             },
             Shape::Ellipse {
                 rect: PixelRect::new(30.0, 30.0, 50.0, 30.0),
                 color: AnnoColor::BLUE,
                 width: 2.0,
+                fill: Some(AnnoColor::RED),
+                has_stroke: true,
             },
             Shape::Arrow {
                 from: (10.0, 70.0),
@@ -773,11 +1485,15 @@ mod tests {
             },
             Shape::Text {
                 pos: (20.0, 20.0),
-                content: "拾景test".to_string(),
+                content: "望川test".to_string(),
                 color: AnnoColor::WHITE,
                 size: 20.0,
                 bg: true,
                 bg_color: AnnoColor::BLACK,
+                max_w: None,
+                font_family: None,
+                stroke_color: Some(AnnoColor::BLACK),
+                stroke_width: 3.0,
             },
         ];
         // 有字体则连文字一起烧录，无字体也应正常导出底图 + 图形。
@@ -815,6 +1531,10 @@ mod tests {
                 size: 20.0,
                 bg: true,
                 bg_color: AnnoColor::BLACK,
+                max_w: None,
+                font_family: None,
+                stroke_color: None,
+                stroke_width: 3.0,
             },
             Shape::Text {
                 pos: (10.0, 40.0),
@@ -823,6 +1543,10 @@ mod tests {
                 size: 20.0,
                 bg: false,
                 bg_color: AnnoColor::WHITE,
+                max_w: None,
+                font_family: None,
+                stroke_color: None,
+                stroke_width: 3.0,
             },
         ];
         let font = load_system_font();

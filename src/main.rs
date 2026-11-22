@@ -7,11 +7,15 @@ mod capture;
 mod cli;
 mod config;
 mod export;
+mod feedback;
 mod hotkey;
 mod i18n;
 mod ocr;
 mod overlay;
 mod picker;
+mod pin;
+mod qr;
+mod record;
 mod shapes;
 mod toast;
 mod tray;
@@ -23,7 +27,7 @@ use std::{cell::RefCell, rc::Rc};
 use rgpui::{App, Bounds, Entity, WindowHandle, prelude::*, px, size};
 use rgpui_platform::application;
 
-use crate::{app::RupixApp, hotkey::HotkeyKind};
+use crate::{app::RivixApp, hotkey::HotkeyKind};
 
 // 检查器全局动作：F12 开关右侧 inspector 面板。
 // 仅调试构建（或显式 --features inspector）编译，release 默认剥离。
@@ -40,13 +44,21 @@ fn main() {
     }
     // 单例守卫：已有实例在跑（托盘常驻）则直接退出，避免热键冲突与重复托盘图标。
     // 守卫必须存活整个进程期，故意泄漏持有到进程结束。
-    let Ok(_guard) = rgpui::SingleInstance::acquire("rupix") else {
+    let Ok(_guard) = rgpui::SingleInstance::acquire("rivix") else {
         return;
     };
     std::mem::forget(_guard);
     application().run(|cx: &mut App| {
         // 初始化主题与内置组件（HotkeyInput / Input 等依赖它）。
         rgpui::init_all(cx);
+        app::apply_theme(cx);
+        // 静态缓存不会自动析构，正常退出时显式回收 OCR 子进程与显存。
+        cx.on_app_quit(|cx| {
+            cx.background_executor().spawn(async {
+                ocr::shutdown();
+            })
+        })
+        .detach();
         // 语言初始化必须在建窗前：窗口标题与状态文案都走词表。
         i18n::init();
 
@@ -66,18 +78,19 @@ fn main() {
         let picker_hotkey = hotkey::load_hotkey_string(HotkeyKind::Picker);
 
         // 主窗口实体需要在构建闭包外使用，用容器带出来。
-        let main_cell: Rc<RefCell<Option<Entity<RupixApp>>>> = Rc::new(RefCell::new(None));
+        let main_cell: Rc<RefCell<Option<Entity<RivixApp>>>> = Rc::new(RefCell::new(None));
         let main_cell_for_build = main_cell.clone();
         let region_for_build = region_hotkey.clone();
         let full_for_build = full_hotkey.clone();
         let picker_for_build = picker_hotkey.clone();
-        // 三张热键卡片 + 截图行为两项，默认窗口加高到 480，保证截图 Tab 不用滚动。
-        let bounds = Bounds::centered(None, size(px(560.), px(480.)), cx);
+        // 融合式自定义标题栏，800x580 现代设置中心窗口。
+        let bounds = Bounds::centered(None, size(px(800.), px(580.)), cx);
         let opened = cx.open_window(
             rgpui::WindowOptions {
                 window_bounds: Some(rgpui::WindowBounds::Windowed(bounds)),
                 titlebar: Some(rgpui::TitlebarOptions {
                     title: Some(i18n::tr("app.window_title").into()),
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 // 设置窗口平时不需要显示：启动即隐藏到托盘，
@@ -88,7 +101,7 @@ fn main() {
             },
             move |window, cx| {
                 let view = cx.new(|cx| {
-                    RupixApp::new(
+                    RivixApp::new(
                         window,
                         cx,
                         region_for_build,
@@ -97,6 +110,11 @@ fn main() {
                     )
                 });
                 *main_cell_for_build.borrow_mut() = Some(view.clone());
+                // 系统外观变化时更新托盘线条颜色，不改应用已确认的深色配色。
+                view.update(cx, |_, cx| {
+                    cx.observe_window_appearance(window, |_, _, cx| tray::refresh_icon(cx))
+                        .detach();
+                });
                 // 关闭按钮只隐藏到托盘，不退出进程（退出走托盘菜单）。
                 window.on_window_should_close(cx, |window, _| {
                     window.hide_window();
@@ -107,16 +125,16 @@ fn main() {
         );
         // 建窗失败属于环境级故障（无显示服务 / 资源耗尽）：没有主窗口就挂不了托盘与热键，
         // 打印原因后让事件循环自行结束，不用 expect 把用户砸进崩溃弹窗。
-        let main_win: WindowHandle<RupixApp> = match opened {
+        let main_win: WindowHandle<RivixApp> = match opened {
             Ok(handle) => handle,
             Err(error) => {
-                eprintln!("打开 Rupix 主窗口失败：{error}");
+                eprintln!("打开 Rivix 主窗口失败：{error}");
                 return;
             }
         };
         // 建窗闭包同步执行，正常路径下必有实体；取不到同样按环境故障退出。
         let Some(main) = main_cell.borrow().clone() else {
-            eprintln!("Rupix 主视图未初始化，放弃启动");
+            eprintln!("Rivix 主视图未初始化，放弃启动");
             return;
         };
 
@@ -134,22 +152,15 @@ fn main() {
                 boot_errors.push(error.clone());
             }
         }
-        let boot_msg = if boot_errors.is_empty() {
-            i18n::tr_fmt(
-                "app.boot_ready",
-                &[
-                    ("region", &region_hotkey),
-                    ("full", &full_hotkey),
-                    ("picker", &picker_hotkey),
-                ],
-            )
-        } else {
-            boot_errors.join("; ")
-        };
-        main.update(cx, |view, cx| view.set_status(&boot_msg, cx));
+        if !boot_errors.is_empty() {
+            let err_msg = boot_errors.join("; ");
+            main.update(cx, |view, cx| view.set_status(&err_msg, cx));
+        }
         cx.on_global_hotkey(move |id, cx| {
-            // 按编号分发截图种类，其他全局热键（若有）忽略。
-            if id == HotkeyKind::Region.id() {
+            // 按编号分发截图种类或停止录屏，其他全局热键（若有）忽略。
+            if id == record::STOP_HOTKEY_SHIFT_ESC_ID {
+                record::stop_active();
+            } else if id == HotkeyKind::Region.id() {
                 tray::trigger_capture(cx, main_win, main.clone(), false);
             } else if id == HotkeyKind::Full.id() {
                 tray::trigger_capture(cx, main_win, main.clone(), true);
@@ -158,6 +169,6 @@ fn main() {
             }
         });
 
-        cx.activate(true);
+        // 启动只驻留托盘；应用级激活会在 Windows 上重新显示隐藏的设置窗口。
     });
 }

@@ -1,48 +1,35 @@
-//! 图片预览与标注窗口：截图完成后独立展示，像图片浏览器一样查看并标注。
-//!
-//! - 打开时窗口大小固定（跟随显示器约 75%），图片在图片区内居中显示，
-//!   大图按比例缩小完整落入，小图居中 100% 显示；之后窗口固定不再变化；
-//! - 缩放只改变图片大小（图片居中，超出可拖拽平移），窗口不再跟随变化；
-//! - 系统标题栏显示窗口名与尺寸，客户区顶部压缩为两排工具条：
-//!   - 操作排：缩小 / 放大 / 适应 / 撤销 / 重做 / 线宽 / 文字底色 / 复制 / 保存；
-//!   - 标注排：选择 / 矩形 / 椭圆 / 箭头 / 画笔 / 荧光笔 / 橡皮擦 / 马赛克 / 文字 /
-//!     预设颜色（精简，自定义色走取色器）/ 操作提示；
-//! - 标注画在覆盖图片的 `canvas` 上实时预览，
-//!   保存 / 复制时经 `export::render_export` 烧录为同一坐标系的最终图；
-//! - 文字工具支持：点击新建、点击已有文字重新编辑、Ctrl+拖动移动；
-//!   每条文字底色独立，底色块点开取色器可设底色（默认跟随字色自适应）。
-//! - 默认矩形工具（打开即画，单击不成形）；空格按住 / 中键拖拽可临时平移，与工具无关。
-//! - `Ctrl + 滚轮`、`+` / `-` / `0`、`V` / `1-8` 切工具、Esc 快捷键齐全。
-//! - 操作排“识别”按钮后台跑 OCR（PP-OCRv5 mobile）：图上编号矩形框标出行位置，
-//!   右侧面板默认列出全部文字，点框 / 点行双向选中（文本进剪贴板），确认后可落为标注。
+//! 图片标注编辑器：自定义标题栏、矢量绘制、原图像素取色与滚轮缩放。
+//! 绘制中按空格平移当前草稿，松开空格继续绘制；空白处空格拖动或中键平移画布。
+//! 关闭时提交文字和有效草稿，后台复制结果，不显示二次确认；Ctrl+S 单独保存结果图。
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use ab_glyph::FontVec;
 use image::RgbaImage;
 use rgpui::{
-    Bounds, Context, CursorStyle, Div, Entity, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Render, Rgba,
-    ScrollDelta, ScrollWheelEvent, SharedString, Slider, SliderEvent, SliderState, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas,
-    components::ColorPickerState,
-    div, fill, img,
+    Bounds, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Render,
+    Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Slider, SliderEvent, SliderState,
+    Subscription, Window, WindowBounds, WindowOptions, canvas, div, fill, img,
     input_ui::{Input, InputState},
     point,
     prelude::*,
-    px, rgb, size,
+    px, rgb, rgba, size,
 };
 
 use crate::{
-    app::{PreviewImage, RupixApp, load_save_dir},
+    app::{PreviewImage, RivixApp, load_save_dir},
     capture::cap_log,
     export::{
-        copy_image_and_file_to_clipboard, copy_png_to_clipboard, load_rgba, load_system_font,
-        measure_text_width, png_bytes, render_export,
+        copy_image_and_file_to_clipboard, copy_png_to_clipboard, load_system_font, png_bytes,
+        render_export,
     },
     i18n::{tr, tr_fmt},
-    ocr,
-    shapes::{AnnoColor, PixelRect, Shape},
+    shapes::{AnnoColor, PixelRect, Shape, TEXT_LINE_HEIGHT},
 };
 
 /// 最小缩放（10%）。
@@ -51,22 +38,22 @@ const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 8.0;
 /// 单次按钮缩放步进（×1.25）。
 const ZOOM_STEP: f32 = 1.25;
-/// 工具条单排高度（逻辑像素）。
-const ROW_H: f32 = 40.0;
-/// 顶部工具条总高度（客户区两排：操作 / 标注，系统标题栏在其外不计入）。
-const TOOLBAR_H: f32 = ROW_H * 2.0;
-/// 底部状态栏高度（逻辑像素）。
-const STATUS_H: f32 = 30.0;
-/// 预览窗口最小宽（逻辑像素，固定窗口下限，保证两排工具条不拥挤）。
-const MIN_VIEWER_W: f32 = 720.0;
-/// 预览窗口最小总高（逻辑像素，含两排工具条与状态栏）。
-const MIN_VIEWER_H: f32 = 520.0;
+/// 预览窗口最小宽（逻辑像素，保证左右悬浮面板与中央画布协调）。
+const MIN_VIEWER_W: f32 = 860.0;
+/// 预览窗口最小总高（逻辑像素）。
+const MIN_VIEWER_H: f32 = 600.0;
 /// 画笔默认线宽（图片像素）。
 const DEFAULT_WIDTH: f32 = 4.0;
 /// 橡皮擦半径（图片像素，画笔类额外叠加自身半宽）。
 const ERASER_RADIUS: f32 = 8.0;
 /// 文字标注默认字号（图片像素）。
 const DEFAULT_TEXT_SIZE: f32 = 28.0;
+/// Windows 明确使用微软雅黑，与离线导出读取的系统字体保持一致。
+#[cfg(target_os = "windows")]
+const TEXT_FONT_FAMILY: &str = "Microsoft YaHei";
+/// 其他平台仍使用系统默认字体。
+#[cfg(not(target_os = "windows"))]
+const TEXT_FONT_FAMILY: &str = ".SystemUIFont";
 /// 线宽最小值（图片像素，滑杆下限）。
 const WIDTH_MIN: f32 = 1.0;
 /// 线宽最大值（图片像素，滑杆上限）。
@@ -86,6 +73,10 @@ enum AnnoTool {
     Rect,
     /// 椭圆框。
     Ellipse,
+    /// 直线。
+    Line,
+    /// 截图像素吸管。
+    Eyedropper,
     /// 箭头。
     Arrow,
     /// 自由画笔。
@@ -105,6 +96,14 @@ impl AnnoTool {
     fn from_shortcut(key: &str) -> Option<Self> {
         match key {
             "v" => Some(Self::Select),
+            "r" => Some(Self::Rect),
+            "l" => Some(Self::Line),
+            "o" => Some(Self::Ellipse),
+            "i" => Some(Self::Eyedropper),
+            "e" => Some(Self::Eraser),
+            "t" => Some(Self::Text),
+            "b" => Some(Self::Pen),
+            "m" => Some(Self::Mosaic),
             "1" => Some(Self::Rect),
             "2" => Some(Self::Ellipse),
             "3" => Some(Self::Arrow),
@@ -118,8 +117,25 @@ impl AnnoTool {
     }
 }
 
+/// 多选对齐方式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlignMode {
+    /// 顶对齐。
+    Top,
+    /// 左对齐。
+    Left,
+    /// 底对齐。
+    Bottom,
+    /// 右对齐。
+    Right,
+    /// 水平居中对齐。
+    CenterH,
+    /// 垂直居中对齐。
+    CenterV,
+}
+
 /// 工具条动作（按钮与快捷键共用分发，Debug 用于诊断日志）。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum ViewerAction {
     /// 放大。
     ZoomIn,
@@ -143,30 +159,36 @@ enum ViewerAction {
     WidthNudge(f32),
     /// 切换文字背景显示。
     TextBg,
-    /// 识别图中文字（后台跑 OCR，结果进面板，可复制 / 落为标注）。
-    Ocr,
-    /// 复制面板里全部识别文本。
-    OcrCopyAll,
-    /// 点框 / 点行选中的识别行：两侧同步高亮，文本进剪贴板（状态栏回显确认）。
-    OcrSelectLine(usize),
-    /// 把面板里的识别行落成文字标注。
-    OcrApply,
-    /// 关闭 OCR 结果面板。
-    CloseOcrPanel,
-    /// 打开取色器并设为底色目标（点底色块用；取色只改字色）。
-    PickBg,
-    /// 展开 / 收起自定义颜色选择器。
-    ToggleColorPicker,
+    /// 步进调节字体大小（仅对当前文字或选中的文字有效）。
+    TextSizeNudge(f32),
+    /// 切换文字字体家族（仅对当前文字或选中的文字有效）。
+    TextFont(Option<String>),
+    /// 展开 / 收起系统字体下拉列表。
+    ToggleFontDropdown,
+    /// 切换取色器目标（`false` = 填充，`true` = 描边）。
+    PickBg(bool),
+    /// Shift+X 互换填充与描边（仅矩形 / 椭圆 / 多边形有效）。
+    SwapFillStroke,
+    /// 清除当前目标的可选颜色（矩形/椭圆/多边形的填充或描边，或文字描边）。
+    ClearOptionalColor,
+    /// 步进调节矩形圆角半径。
+    RectRadiusNudge(f32),
+    /// 多选对齐（顶 / 左 / 底 / 右 / 水平居中 / 垂直居中）。
+    Align(AlignMode),
+    /// 展开 / 收起左侧工具箱名称标签。
+    ToggleDock,
+    /// 切换深浅色主题。
+    ToggleTheme,
     /// 打开最近一次保存的文件（系统默认程序）。
     OpenSavedFile,
     /// 打开最近一次保存文件所在目录（系统文件管理器）。
     OpenSavedDir,
-    /// 关闭确认：保存并关闭（有未保存修改时）。
-    ConfirmSaveClose,
-    /// 关闭确认：不保存，直接关闭（有未保存修改时）。
-    ConfirmDiscardClose,
-    /// 关闭确认：取消关闭，继续编辑。
-    CancelCloseConfirm,
+    /// 进入或退出变换模式（与 Ctrl+T 相同）。
+    Transform,
+    /// 完成当前编辑并将结果置顶钉在屏幕上。
+    Pin,
+    /// 复制结果并关闭编辑窗口。
+    Close,
 }
 
 /// 预览窗口初始布局：窗口大小固定（跟随显示器），图片居中、仅缩小适配。
@@ -194,7 +216,7 @@ fn viewer_layout(disp_w: f32, disp_h: f32, img_w: u32, img_h: u32) -> (f32, f32,
         .min(disp_h - 20.0)
         .max(360.0);
     let area_w = win_w;
-    let area_h = (win_h - TOOLBAR_H - STATUS_H).max(200.0);
+    let area_h = win_h.max(200.0);
     // 适应缩放：完整落入图片区，只缩小不放大（小图居中 100% 显示更清晰）。
     let fit = (area_w / img_w as f32)
         .min(area_h / img_h as f32)
@@ -208,8 +230,8 @@ fn viewer_layout(disp_w: f32, disp_h: f32, img_w: u32, img_h: u32) -> (f32, f32,
 /// - `main`: 主视图实体（复制 / 保存后回写状态用）。
 /// - `cx`: 调用方上下文（全屏截图与区域浮层各调一次，泛型兼容）。
 /// - `preview`: 要展示的图片（路径 + 原图尺寸）。
-pub fn open_viewer<T: 'static>(main: Entity<RupixApp>, cx: &mut Context<T>, preview: PreviewImage) {
-    // 固定窗口：按显示器算出图片区，图片居中、仅缩小适配。
+pub fn open_viewer<T: 'static>(main: Entity<RivixApp>, cx: &mut Context<T>, preview: PreviewImage) {
+    // 固定窗口：按显示器算出全幅画布区，图片居中、仅缩小适配。
     let (disp_w, disp_h) = cx
         .primary_display()
         .map(|d| {
@@ -222,12 +244,8 @@ pub fn open_viewer<T: 'static>(main: Entity<RupixApp>, cx: &mut Context<T>, prev
         "预览窗口打开：img={}x{} area={}x{} fit={fit:.2}",
         preview.w, preview.h, area_w as u32, area_h as u32
     ));
-    // 窗口高度 = 两排工具条 + 图片区 + 底部状态栏。
-    let bounds = Bounds::centered(
-        None,
-        size(px(area_w), px(area_h + TOOLBAR_H + STATUS_H)),
-        cx,
-    );
+    // 全幅底层画布，工具箱与属性栏悬浮在其上层。
+    let bounds = Bounds::centered(None, size(px(area_w), px(area_h)), cx);
     let opened = cx.open_window(
         viewer_window_options(bounds, &preview),
         move |window, cx| {
@@ -245,7 +263,8 @@ pub fn open_viewer<T: 'static>(main: Entity<RupixApp>, cx: &mut Context<T>, prev
             // 打开即聚焦，Esc / 快捷键立即可用。
             let handle = view.read(cx).focus_handle.clone();
             window.focus(&handle, cx);
-            // 系统 X 也要过脏检查，否则有标注点 X 会静默丢失。
+            window.set_window_title(&tr("viewer.editor_title"));
+            // Alt+F4 与自定义关闭按钮使用同一份复制收尾。
             guard_viewer_close(window, cx, view.clone());
             view
         },
@@ -255,48 +274,21 @@ pub fn open_viewer<T: 'static>(main: Entity<RupixApp>, cx: &mut Context<T>, prev
     }
 }
 
-/// 注册系统标题栏 X 关闭拦截：之前只有 Esc 走脏检查，点 X 会静默丢弃未保存标注。
-///
-/// 有未保存修改时先提交输入中的文字、丢弃未成形草稿，展开窗内确认浮层并取消本次系统关闭；
-/// 无修改直接放行；确认浮层里的“不保存”走 `remove_window`（不触发本回调），不会自锁。
+/// 所有关闭入口先复制结果，无确认弹窗；异步复制完成后显式移除窗口。
 fn guard_viewer_close(window: &mut Window, cx: &mut rgpui::App, view: Entity<ImageViewer>) {
     window.on_window_should_close(cx, move |window, cx| {
-        // `Entity::update` 直接返回值（`WeakEntity` 才包 `Result`），这里无需拆包。
-        let veto = view.update(cx, |this, cx| {
-            // 输入中的文字先落为标注，避免点 X 把刚打的字静默丢掉。
-            if this.text_editing.is_some() {
-                this.commit_text(window, cx);
-            }
-            // 未成形草稿本就不会进保存结果，这里直接丢弃，只看已提交的脏标记。
-            this.draft = None;
-            this.anchor = None;
-            if this.dirty {
-                this.confirm_close = true;
-                cx.notify();
-                true
-            } else {
-                false
-            }
-        });
-        !veto
+        view.update(cx, |this, cx| this.copy_and_close(window, cx));
+        false
     });
 }
 
-/// 构造预览窗口选项：系统标题栏显示带图片尺寸的窗口名。
-///
-/// # 参数
-/// - `bounds`: 窗口初始边界（含两排工具条与状态栏占高）。
-/// - `preview`: 要展示的图片（取宽高写入窗口 / 任务栏标题）。
-fn viewer_window_options(bounds: Bounds<Pixels>, preview: &PreviewImage) -> WindowOptions {
+/// 保留系统移动、缩放和圆角能力，标题栏由客户区绘制。
+fn viewer_window_options(bounds: Bounds<Pixels>, _preview: &PreviewImage) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from(tr_fmt(
-                "viewer.title",
-                &[("w", &preview.w.to_string()), ("h", &preview.h.to_string())],
-            ))),
-            ..Default::default()
-        }),
+        titlebar: None,
+        app_owns_titlebar_drag: true,
+        window_min_size: Some(size(px(MIN_VIEWER_W), px(MIN_VIEWER_H))),
         ..Default::default()
     }
 }
@@ -331,7 +323,7 @@ pub fn preview_from_path(path: &std::path::Path) -> Option<PreviewImage> {
 /// # 参数
 /// - `main`: 设置窗口实体（保存历史回写用）。
 /// - `cx`: 应用上下文。
-pub fn open_image_for_edit_in_app(main: Entity<RupixApp>, cx: &mut rgpui::App) {
+pub fn open_image_for_edit_in_app(main: Entity<RivixApp>, cx: &mut rgpui::App) {
     // 原生打开对话框：只选单个图片文件。
     let receiver = cx.prompt_for_paths(rgpui::PathPromptOptions {
         files: true,
@@ -363,7 +355,7 @@ pub fn open_image_for_edit_in_app(main: Entity<RupixApp>, cx: &mut rgpui::App) {
 }
 
 /// 从 `App` 上下文直接按路径打开预览窗口（异步选图任务内部用）。
-fn open_viewer_in_app(main: Entity<RupixApp>, cx: &mut rgpui::App, preview: PreviewImage) {
+fn open_viewer_in_app(main: Entity<RivixApp>, cx: &mut rgpui::App, preview: PreviewImage) {
     // 固定窗口布局与 `open_viewer` 一致：窗口跟随显示器，图片居中适配。
     let (disp_w, disp_h) = cx
         .primary_display()
@@ -377,11 +369,7 @@ fn open_viewer_in_app(main: Entity<RupixApp>, cx: &mut rgpui::App, preview: Prev
         "预览窗口打开（本地图片）：img={}x{} area={}x{} fit={fit:.2}",
         preview.w, preview.h, area_w as u32, area_h as u32
     ));
-    let bounds = Bounds::centered(
-        None,
-        size(px(area_w), px(area_h + TOOLBAR_H + STATUS_H)),
-        cx,
-    );
+    let bounds = Bounds::centered(None, size(px(area_w), px(area_h)), cx);
     let opened = cx.open_window(
         viewer_window_options(bounds, &preview),
         move |window, cx| {
@@ -427,7 +415,7 @@ struct DragShape {
 /// 图片预览视图。
 struct ImageViewer {
     /// 主视图实体（回写状态 / 最近文件）。
-    main: Entity<RupixApp>,
+    main: Entity<RivixApp>,
     /// 展示的图片。
     preview: PreviewImage,
     /// 预览用底图像素（马赛克实时预览采样用）。
@@ -444,7 +432,7 @@ struct ImageViewer {
     offset: (f32, f32),
     /// 平移中上一次的鼠标位置（窗口坐标），None 表示未按下。
     pan_last: Option<(f32, f32)>,
-    /// 空格是否按住（按住时左键拖拽临时平移，与当前工具无关）。
+    /// 空格是否按住：绘制中移动草稿，否则左键拖动平移画布。
     space_held: bool,
     /// 当前标注工具。
     tool: AnnoTool,
@@ -456,12 +444,55 @@ struct ImageViewer {
     draft: Option<Shape>,
     /// 图形类工具的起点（图片像素），画笔工具不用。
     anchor: Option<(f32, f32)>,
+    /// 绘制中的终点和上次鼠标位置，松开空格继续绘制不跳回原位置。
+    draft_end: Option<(f32, f32)>,
+    draft_last: Option<(f32, f32)>,
+    /// 取色后恢复原来的绘图工具。
+    sample_return_tool: AnnoTool,
+    /// 正在复制关闭时防止重复收尾。
+    closing: bool,
+    /// 当前选择及 Ctrl+T 变换，保存取消时的全部原始标注（支持多选整体变换）。
+    selected: Option<usize>,
+    transform_originals: Vec<(usize, Shape)>,
+    /// 保留本轮变换框，短线和小文字缩放时控制点也连续跟手。
+    transform_frame: Option<PixelRect>,
+    transform_drag: Option<TransformDrag>,
     /// 当前标注颜色。
     color: AnnoColor,
-    /// 自定义颜色选择器状态。
-    color_picker: Entity<ColorPickerState>,
-    /// 是否展开颜色选择器面板。
-    show_color_picker: bool,
+    /// 内置圆角方形取色器状态（色相 0..360，饱和度 0..1，明度 0..1）。
+    picker_hue: f32,
+    picker_sat: f32,
+    picker_val: f32,
+    /// SV 取色区和横向色相条最近一次绘制的屏幕边界，用于拖拽取色换算。
+    sv_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    hue_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    /// 是否正在拖拽 SV 取色区或色相条。
+    sv_dragging: bool,
+    hue_dragging: bool,
+    /// 左侧工具箱是否收起为紧凑纯图标模式。
+    dock_compact: bool,
+    /// 选择工具在空白处左键框选的临时矩形（图片像素坐标：起点 x, y, 当前 x, y）。
+    marquee: Option<(f32, f32, f32, f32)>,
+    /// 多选时选中的全部标注索引（与 `selected` 协同工作）。
+    selected_many: Vec<usize>,
+    /// 吸管工具是否正在按住拖动实时取色。
+    eyedropper_dragging: bool,
+    /// 当前文字默认字号（图片像素）。
+    text_size: f32,
+    /// 字号滑杆与订阅（居中相对滑杆：左拖缩小、右拖放大，松手归零）。
+    text_size_slider: Entity<SliderState>,
+    #[allow(dead_code)]
+    text_size_subscription: Subscription,
+    /// 本次拖动字号滑杆起始时的基准字号。
+    text_size_drag_base: Option<f32>,
+    /// 手动输入字号文本框。
+    text_size_input: Entity<InputState>,
+    /// 当前文字默认字体家族（None 表示系统默认字体）。
+    text_font: Option<String>,
+    /// 字体选择下拉列表是否展开。
+    font_dropdown_open: bool,
+    /// 文本工具按住拖出自动换行框的临时坐标。
+    text_box_draft: Option<(f32, f32, f32, f32)>,
     /// 当前线宽（图片像素）。
     width: f32,
     /// 线宽滑杆状态（操作排，拖动在 1–30px 内自由调节）。
@@ -477,14 +508,28 @@ struct ImageViewer {
     text_bg_color: AnnoColor,
     /// 底色是否被手动指定过（指定后换字色不再自动适配底色）。
     bg_color_custom: bool,
-    /// 取色器当前目标：`false` 改字色，`true` 改底色。
-    picker_for_bg: bool,
+    /// 当前填充颜色（矩形 / 椭圆 / 多边形使用，None 表示无填充）。
+    anno_fill: Option<AnnoColor>,
+    /// 当前是否启用描边（矩形 / 椭圆 / 多边形使用）。
+    anno_has_stroke: bool,
+    /// 当前矩形圆角半径（图片像素，0 表示直角）。
+    anno_rect_radius: f32,
+    /// 矩形圆角滑杆与订阅。
+    rect_radius_slider: Entity<SliderState>,
+    #[allow(dead_code)]
+    rect_radius_subscription: Subscription,
+    /// 当前文字描边颜色（None 表示无描边，圆形描边位于文字后方）。
+    text_stroke_color: Option<AnnoColor>,
+    /// 取色器当前目标：`false` 改填充，`true` 改描边。
+    color_target_stroke: bool,
     /// Ctrl+拖动文字的临时状态。
     drag_text: Option<DragText>,
     /// 选择工具拖动普通标注的临时状态。
     drag_shape: Option<DragShape>,
     /// 选择工具悬停时是否命中已有标注（用于切换鼠标形状）。
     hover_shape: bool,
+    /// 仅在变换控制点切换时刷新系统光标。
+    transform_hover: Option<TransformHandle>,
     /// 橡皮擦拖动中（抬起鼠标结束，期间移动持续删除）。
     erasing: bool,
     /// 缓存的系统字体（文字烧录用，懒加载）。
@@ -493,34 +538,64 @@ struct ImageViewer {
     font_loaded: bool,
     /// 根视图焦点（键盘快捷键用）。
     focus_handle: FocusHandle,
-    /// 底部状态栏文本（复制 / 保存结果就近显示，不依赖设置窗口）。
+    /// 左下角状态提示文本（复制 / 保存 / 取色等操作反馈，3 秒后渐隐消失）。
     status: SharedString,
+    /// 最近一次状态提示的触发时间。
+    status_at: Option<Instant>,
+    /// 状态提示递增序号（防止旧定时器覆盖新提示）。
+    status_seq: u64,
     /// 最近一次保存的文件路径（状态栏“打开文件 / 打开目录”用）。
     last_saved: Option<PathBuf>,
-    /// 是否有未保存的标注修改（Esc 关窗前据此决定是否弹出确认）。
-    dirty: bool,
-    /// OCR 是否正在后台运行（跑着时再点识别直接提示，不重开任务）。
-    ocr_running: bool,
-    /// 最近一次识别的行（面板展示用；落为标注只是快照，之后改标注不影响这里）。
-    ocr_lines: Vec<ocr::OcrLine>,
-    /// 是否展开 OCR 结果面板。
-    show_ocr_panel: bool,
-    /// OCR 双向选中的行号（点框 / 点行互相同步高亮，None 表示未选中）。
-    selected_ocr: Option<usize>,
-    /// 是否正在显示关闭确认浮层（有未保存修改时 Esc 弹出三选一）。
-    confirm_close: bool,
 }
 
-/// 文字工具正在编辑的状态：点击图片后出现，回车或失焦提交。
+/// 八个缩放控制点、框体移动与顶部旋转手柄。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransformHandle {
+    Move,
+    Rotate,
+    Nw,
+    N,
+    Ne,
+    E,
+    Se,
+    S,
+    Sw,
+    W,
+}
+/// 每次拖拽保留起始几何（支持多选整组协同缩放平移，避免累计误差）。
+struct TransformDrag {
+    handle: TransformHandle,
+    bounds: PixelRect,
+    sources: Vec<(usize, Shape, PixelRect)>,
+    start: (f32, f32),
+}
+
+/// 文字工具正在编辑的状态：点击图片后出现，回车、Esc 或失焦提交。
 struct TextEdit {
     /// 落点（图片像素坐标）。
     img_pos: (f32, f32),
     /// 输入框实体。
     input: Entity<InputState>,
-    /// 输入框在图片容器内的定位坐标（canvas 本地像素）。
-    container_pos: (f32, f32),
+    /// 原图字号，重新编辑或变换后不重置为默认字号。
+    size: f32,
+    /// 文本框宽度（None 表示单行自由文本；Some(w) 表示自动换行框）。
+    max_w: Option<f32>,
+    /// 字体家族（None 表示默认系统字体）。
+    font_family: Option<String>,
     /// 重新编辑时原 shapes 索引（None 表示新建）。
     edit_index: Option<usize>,
+}
+
+/// 缓存标注界面左上角品牌图标（内嵌 PNG 字节，只构造一次）。
+fn viewer_logo() -> Arc<rgpui::Image> {
+    static LOGO: OnceLock<Arc<rgpui::Image>> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        Arc::new(rgpui::Image::from_bytes(
+            rgpui::ImageFormat::Png,
+            include_bytes!("../assets/logo-viewer.png").to_vec(),
+        ))
+    })
+    .clone()
 }
 
 impl ImageViewer {
@@ -528,29 +603,13 @@ impl ImageViewer {
     fn new(
         _window: &mut Window,
         cx: &mut Context<Self>,
-        main: Entity<RupixApp>,
+        main: Entity<RivixApp>,
         preview: PreviewImage,
         fit_zoom: f32,
         area_w: f32,
         area_h: f32,
     ) -> Self {
-        let view = cx.entity();
-        let color_picker = cx.new(|cx| {
-            ColorPickerState::new(_window, cx)
-                .color(AnnoColor::RED.to_hsla())
-                .on_change(move |color, _window, cx| {
-                    let anno = AnnoColor::from_hsla(color);
-                    view.update(cx, |this, cx| {
-                        // 取色器双目标：底色模式改底色，默认改字色。
-                        if this.picker_for_bg {
-                            this.apply_bg_color(anno, cx);
-                        } else {
-                            this.apply_anno_color(anno);
-                        }
-                        cx.notify();
-                    });
-                })
-        });
+        let (init_h, init_s, init_v) = rgb_to_hsv(AnnoColor::RED);
         // 线宽滑杆：1–30px 自由调节，拖动实时同步当前线宽。
         let width_slider = cx.new(|_| {
             SliderState::new()
@@ -564,10 +623,102 @@ impl ImageViewer {
             |this: &mut Self, _state, event: &SliderEvent, cx| match event {
                 SliderEvent::Change(v) | SliderEvent::Release(v) => {
                     this.width = normalize_width(v.start());
+                    this.apply_width_to_selected();
                     cx.notify();
                 }
             },
         );
+        // 矩形圆角滑杆：0–64px 自由调节，拖动实时同步当前圆角半径。
+        let rect_radius_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(64.0)
+                .step(1.0)
+                .default_value(0.0)
+        });
+        let rect_radius_subscription = cx.subscribe(
+            &rect_radius_slider,
+            |this: &mut Self, _state, event: &SliderEvent, cx| match event {
+                SliderEvent::Change(v) | SliderEvent::Release(v) => {
+                    this.anno_rect_radius = v.start().clamp(0.0, 64.0).round();
+                    this.apply_rect_radius_to_selected();
+                    cx.notify();
+                }
+            },
+        );
+        // 字号滑杆：居中相对调节（-24..+24），左拖缩小、右拖放大，松手自动回中。
+        let text_size_slider = cx.new(|_| {
+            SliderState::new()
+                .min(-24.0)
+                .max(24.0)
+                .step(1.0)
+                .default_value(0.0)
+        });
+        let text_size_input = cx.new(|cx| {
+            let mut st = InputState::new(_window, cx);
+            st.set_value((DEFAULT_TEXT_SIZE as u32).to_string(), _window, cx);
+            st
+        });
+        let text_size_input_for_slider = text_size_input.clone();
+        let text_size_subscription = cx.subscribe_in(
+            &text_size_slider,
+            _window,
+            move |this: &mut Self, state, event: &SliderEvent, window, cx| match event {
+                SliderEvent::Change(v) => {
+                    let base = *this.text_size_drag_base.get_or_insert(this.text_size);
+                    let next_sz = (base + v.start()).clamp(12.0, 120.0).round();
+                    this.text_size = next_sz;
+                    if let Some(editing) = &mut this.text_editing {
+                        editing.size = next_sz;
+                    }
+                    for idx in this.selected_indices() {
+                        if let Some(Shape::Text { size, .. }) = this.shapes.get_mut(idx) {
+                            *size = next_sz;
+                            this.redo_stack.clear();
+                        }
+                    }
+                    let txt = (next_sz as u32).to_string();
+                    text_size_input_for_slider.update(cx, |st, cx| {
+                        if !st.text().eq(txt.as_str()) {
+                            st.set_value(txt, window, cx);
+                        }
+                    });
+                    cx.notify();
+                }
+                SliderEvent::Release(_) => {
+                    this.text_size_drag_base = None;
+                    state.update(cx, |s, cx| s.set_value(0.0, window, cx));
+                    cx.notify();
+                }
+            },
+        );
+        cx.observe_in(
+            &text_size_input,
+            _window,
+            move |this: &mut Self, state, _window, cx| {
+                let raw_text = state.read(cx).text().to_string();
+                let raw = raw_text.trim();
+                if let Ok(val) = raw.parse::<f32>()
+                    && (12.0..=120.0).contains(&val)
+                {
+                    let next_sz = val.round();
+                    if (this.text_size - next_sz).abs() > 0.1 {
+                        this.text_size = next_sz;
+                        if let Some(editing) = &mut this.text_editing {
+                            editing.size = next_sz;
+                        }
+                        for idx in this.selected_indices() {
+                            if let Some(Shape::Text { size, .. }) = this.shapes.get_mut(idx) {
+                                *size = next_sz;
+                                this.redo_stack.clear();
+                            }
+                        }
+                        cx.notify();
+                    }
+                }
+            },
+        )
+        .detach();
         // 马赛克预览直接采样底图；读取失败时仍保留导出能力，只是不显示实时像素化预览。
         let base_image = image::open(&preview.path)
             .ok()
@@ -589,129 +740,440 @@ impl ImageViewer {
             redo_stack: Vec::new(),
             draft: None,
             anchor: None,
+            draft_end: None,
+            draft_last: None,
+            sample_return_tool: AnnoTool::Rect,
+            closing: false,
+            selected: None,
+            transform_originals: Vec::new(),
+            transform_frame: None,
+            transform_drag: None,
             color: AnnoColor::RED,
-            color_picker,
-            show_color_picker: false,
+            picker_hue: init_h,
+            picker_sat: init_s,
+            picker_val: init_v,
+            sv_bounds: Arc::new(Mutex::new(None)),
+            hue_bounds: Arc::new(Mutex::new(None)),
+            sv_dragging: false,
+            hue_dragging: false,
+            dock_compact: false,
+            marquee: None,
+            selected_many: Vec::new(),
+            eyedropper_dragging: false,
+            text_size: DEFAULT_TEXT_SIZE,
+            text_size_slider,
+            text_size_subscription,
+            text_size_drag_base: None,
+            text_size_input,
+            text_font: None,
+            font_dropdown_open: false,
+            text_box_draft: None,
             width: DEFAULT_WIDTH,
             width_slider,
             width_subscription,
             text_editing: None,
-            text_bg: true,
+            text_bg: false,
             // 默认红字配自适应底（浅色字黑底、深色字白底），用户取过底色后不再自动跟随。
             text_bg_color: AnnoColor::RED.auto_bg(),
             bg_color_custom: false,
-            picker_for_bg: false,
+            anno_fill: None,
+            anno_has_stroke: true,
+            anno_rect_radius: 0.0,
+            rect_radius_slider,
+            rect_radius_subscription,
+            text_stroke_color: None,
+            color_target_stroke: true,
             drag_text: None,
             drag_shape: None,
             hover_shape: false,
+            transform_hover: None,
             erasing: false,
             font: None,
             font_loaded: false,
             focus_handle: cx.focus_handle(),
-            status: SharedString::from(tr("viewer.ready")),
+            status: SharedString::default(),
+            status_at: None,
+            status_seq: 0,
             last_saved: None,
-            // 新窗口无标注，自然是干净状态。
-            dirty: false,
-            ocr_running: false,
-            ocr_lines: Vec::new(),
-            show_ocr_panel: false,
-            selected_ocr: None,
-            confirm_close: false,
         }
     }
 
-    /// 设置预览窗口底部状态栏并刷新（复制 / 保存结果就近显示）。
+    /// 显示左下角状态提示胶囊，保持 2.4 秒后用 0.6 秒渐隐（共 3 秒消失）。
     fn set_viewer_status(&mut self, msg: &str, cx: &mut Context<Self>) {
         self.status = SharedString::from(msg.to_string());
+        self.status_at = Some(Instant::now());
+        self.status_seq = self.status_seq.wrapping_add(1);
+        let seq = self.status_seq;
         cx.notify();
+
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            // 先静默等待 2.4 秒（保持 100% 不透明，不空转刷新）。
+            cx.background_executor()
+                .timer(Duration::from_millis(2400))
+                .await;
+            // 最后 600ms 每 40ms 刷新一次渐隐透明度。
+            for _ in 0..15 {
+                let mut active = false;
+                view.update(cx, |this, cx| {
+                    if this.status_seq == seq {
+                        active = true;
+                        cx.notify();
+                    }
+                });
+                if !active {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+            }
+            view.update(cx, |this, cx| {
+                if this.status_seq == seq {
+                    this.status_at = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
-    /// 是否有未保存的标注修改（Esc 关窗前检查用）。
-    ///
-    /// 草稿是未提交的绘制，同样视为未保存，避免 Esc 直接丢弃。
-    fn has_unsaved_changes(&self) -> bool {
-        self.dirty || self.draft.is_some()
+    /// Ctrl+T 或工具栏「变换」按钮：提交当前草稿后对选中标注（支持多选整体）开启自由变换。
+    fn begin_transform(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transform_originals.is_empty() {
+            self.end_transform(false);
+            cx.notify();
+            return;
+        }
+        if self.text_editing.is_some() {
+            self.commit_text(window, cx);
+        }
+        self.on_anno_up(None, cx);
+        let mut indices = self.selected_indices();
+        if indices.is_empty()
+            && let Some(last) = self.shapes.len().checked_sub(1)
+        {
+            indices.push(last);
+            self.selected = Some(last);
+            self.selected_many = vec![last];
+            self.sync_inspector_from_selected(window, cx);
+        }
+        if indices.is_empty() {
+            self.set_viewer_status(&tr("viewer.transform_empty"), cx);
+            return;
+        }
+        self.transform_originals = indices
+            .iter()
+            .filter_map(|&i| self.shapes.get(i).cloned().map(|s| (i, s)))
+            .collect();
+        self.transform_frame = None;
+        self.transform_frame = self.transform_group_bounds(window);
+        self.tool = AnnoTool::Select;
+        self.set_viewer_status(&tr("viewer.transform_hint"), cx);
     }
 
-    /// 保存并关闭：保存成功才关窗，失败则留在窗口看状态栏原因。
-    fn save_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.save_image(cx) {
-            window.remove_window();
+    /// Enter 确认、Esc 恢复进入变换前的数据；切换工具时保留当前结果。
+    fn end_transform(&mut self, cancel: bool) {
+        if !self.transform_originals.is_empty() {
+            self.status = tr("viewer.ready").into();
+        }
+        self.transform_drag = None;
+        self.transform_frame = None;
+        self.transform_hover = None;
+        let originals = std::mem::take(&mut self.transform_originals);
+        if cancel {
+            for (index, original) in originals {
+                if let Some(shape) = self.shapes.get_mut(index) {
+                    *shape = original;
+                }
+            }
         }
     }
 
-    /// 标题栏按钮（文案 + 动作，id 保证唯一，带悬停反馈）。
-    fn bar_button(
-        &self,
-        cx: &mut Context<Self>,
-        label: impl Into<String>,
-        action: ViewerAction,
-    ) -> impl IntoElement {
-        let view = cx.entity();
-        let label: String = label.into();
-        div()
-            .id(format!("viewer-btn-{label}"))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .text_sm()
-            .cursor_pointer()
-            .bg(rgb(0x3A3A3A))
-            .text_color(rgb(0xFFFFFF))
-            .hover(|style| style.bg(rgb(0x4A4A4A)))
-            .child(label)
-            .on_click(move |_, window, cx| {
-                view.update(cx, |this, cx| this.handle(action, window, cx));
-            })
+    /// 计算单个标注在变换模式下的外接矩形。
+    /// 使用当前窗口字体系统精确计算标注的外包矩形（段落文本按实际折行计算高度）。
+    fn shape_ui_bbox(&self, shape: &Shape, window: &Window) -> PixelRect {
+        match shape {
+            Shape::Text {
+                pos,
+                content,
+                size,
+                max_w,
+                font_family,
+                ..
+            } => {
+                let family = font_family.as_deref().unwrap_or(TEXT_FONT_FAMILY);
+                if let Some(box_w) = max_w {
+                    let lines = wrap_lines_in_ui(window, content, *size, family, *box_w);
+                    PixelRect::new(
+                        pos.0,
+                        pos.1,
+                        *box_w,
+                        (lines.len().max(1) as f32) * size * TEXT_LINE_HEIGHT,
+                    )
+                } else {
+                    let w = measure_line_width(window, content, *size, family);
+                    PixelRect::new(pos.0, pos.1, w.max(*size * 0.5), size * TEXT_LINE_HEIGHT)
+                }
+            }
+            Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. } | Shape::Mosaic { rect } => {
+                *rect
+            }
+            _ => shape.bbox(),
+        }
     }
 
-    /// 小按钮（操作 / 标注排用，选中态高亮，id 保证唯一；压缩占宽用 px_1）。
-    fn mini_button(
-        &self,
-        cx: &mut Context<Self>,
-        id: &str,
-        label: impl Into<String>,
-        action: ViewerAction,
-        selected: bool,
-    ) -> impl IntoElement {
+    fn shape_transform_bounds(&self, index: usize, window: &Window) -> Option<PixelRect> {
+        let shape = self.shapes.get(index)?;
+        let mut bounds = self.shape_ui_bbox(shape, window);
+        let minimum = 16.0 / self.zoom.max(MIN_ZOOM);
+        if bounds.w < minimum {
+            bounds.x -= (minimum - bounds.w) / 2.0;
+            bounds.w = minimum;
+        }
+        if bounds.h < minimum {
+            bounds.y -= (minimum - bounds.h) / 2.0;
+            bounds.h = minimum;
+        }
+        Some(bounds)
+    }
+
+    /// 计算当前变换组（单选或多选整体）的联合控制框。
+    fn transform_group_bounds(&self, window: &Window) -> Option<PixelRect> {
+        if let Some(frame) = self.transform_frame {
+            return Some(frame);
+        }
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut any = false;
+        for &(idx, _) in &self.transform_originals {
+            if let Some(b) = self.shape_transform_bounds(idx, window) {
+                min_x = min_x.min(b.x);
+                min_y = min_y.min(b.y);
+                max_x = max_x.max(b.x + b.w);
+                max_y = max_y.max(b.y + b.h);
+                any = true;
+            }
+        }
+        any.then(|| {
+            PixelRect::new(
+                min_x,
+                min_y,
+                (max_x - min_x).max(1.0),
+                (max_y - min_y).max(1.0),
+            )
+        })
+    }
+
+    /// 完成当前编辑，将原图与全部标注烧录后置顶钉在屏幕上并关闭编辑窗口。
+    fn pin_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.end_transform(false);
+        if self.text_editing.is_some() {
+            self.commit_text(window, cx);
+        }
+        self.on_anno_up(None, cx);
+        let Some(burned) = self.burn_shapes() else {
+            self.set_viewer_status(&tr("viewer.copy_fail"), cx);
+            return;
+        };
+        let pin_image = crate::pin::PinImage::new(burned);
+        if let Err(err) = crate::pin::open(pin_image, None, 1.0, cx) {
+            self.set_viewer_status(&err, cx);
+            return;
+        }
+        self.closing = true;
+        window.remove_window();
+    }
+
+    /// 点 X/Alt+F4 时先隐藏窗口，后台合成和复制；失败时恢复窗口保留全部标注。
+    fn copy_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        if self.text_editing.is_some() {
+            self.commit_text(window, cx);
+        }
+        self.on_anno_up(None, cx);
+        self.end_transform(false);
+        self.closing = true;
+        let base = self.base_image.clone();
+        let path = self.preview.path.clone();
+        let shapes = self.shapes.clone();
         let view = cx.entity();
-        let label: String = label.into();
-        div()
-            .id(format!("viewer-mini-{id}"))
-            .px_1()
-            .py_1()
-            .rounded_md()
-            .text_xs()
-            .cursor_pointer()
-            .bg(if selected {
-                rgb(0x1E90FF)
+        let handle = window.window_handle();
+        window.hide_window();
+        self.main.update(cx, |_, cx| {
+            cx.spawn(async move |weak, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let (png, file) = annotation_png(base, &path, &shapes)?;
+                        let copied = copy_image_and_file_to_clipboard(&png, &file);
+                        Ok::<_, String>((png, copied))
+                    })
+                    .await;
+                let _ = weak.update(cx, |state, cx| {
+                    let copied = match result {
+                        Ok((png, Ok(()))) => {
+                            drop(png);
+                            Ok(())
+                        }
+                        Ok((png, Err(error))) => {
+                            // Windows 关闭必须确认原生复制成功；失败保留编辑结果，不能静默关窗。
+                            #[cfg(target_os = "windows")]
+                            {
+                                drop(png);
+                                Err(error)
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                let _ = error;
+                                copy_png_to_clipboard(cx, &png)
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let message = match &copied {
+                        Ok(()) => {
+                            crate::feedback::completed();
+                            tr("viewer.copy_ok")
+                        }
+                        Err(error) => tr_fmt("viewer.copy_fail", &[("error", error)]),
+                    };
+                    state.set_status(&message, cx);
+                    view.update(cx, |this, cx| {
+                        this.closing = false;
+                        this.set_viewer_status(&message, cx);
+                    });
+                    let _ = cx.update_window(handle, |_, window, _| {
+                        if copied.is_ok() {
+                            window.remove_window();
+                        } else {
+                            window.activate_window();
+                        }
+                    });
+                    if copied.is_err() {
+                        crate::toast::show(cx, message);
+                    }
+                });
+            })
+            .detach();
+        });
+    }
+
+    /// 当前工具/选中项的颜色能力：`(是否显示颜色卡, 是否支持填充, 是否支持描边)`。
+    fn active_color_mode_flags(&self) -> (bool, bool, bool) {
+        let indices = self.selected_indices();
+        if !indices.is_empty() {
+            let mut any_non_mosaic = false;
+            let mut any_fill = false;
+            for idx in indices {
+                match self.shapes.get(idx) {
+                    Some(Shape::Mosaic { .. }) | None => {}
+                    Some(
+                        Shape::Rect { .. }
+                        | Shape::Ellipse { .. }
+                        | Shape::Polygon { .. }
+                        | Shape::Text { .. },
+                    ) => {
+                        any_non_mosaic = true;
+                        any_fill = true;
+                    }
+                    Some(
+                        Shape::Pen { .. }
+                        | Shape::Highlighter { .. }
+                        | Shape::Line { .. }
+                        | Shape::Arrow { .. },
+                    ) => {
+                        any_non_mosaic = true;
+                    }
+                }
+            }
+            return (any_non_mosaic, any_fill, any_non_mosaic);
+        }
+        if self.text_editing.is_some() || self.tool == AnnoTool::Text {
+            return (true, true, true);
+        }
+        match self.tool {
+            AnnoTool::Mosaic => (false, false, false),
+            AnnoTool::Line | AnnoTool::Arrow | AnnoTool::Pen | AnnoTool::Highlighter => {
+                (true, false, true)
+            }
+            AnnoTool::Rect
+            | AnnoTool::Ellipse
+            | AnnoTool::Text
+            | AnnoTool::Select
+            | AnnoTool::Eraser
+            | AnnoTool::Eyedropper => (true, true, true),
+        }
+    }
+
+    /// 当前是否处于“文字上下文”（文字工具激活、正在输入文字、或选中项含文字且无图形）。
+    fn is_text_color_context(&self) -> bool {
+        if self.text_editing.is_some() || self.tool == AnnoTool::Text {
+            return true;
+        }
+        let indices = self.selected_indices();
+        !indices.is_empty()
+            && indices
+                .iter()
+                .all(|&i| matches!(self.shapes.get(i), Some(Shape::Text { .. })))
+    }
+
+    /// 实际生效的取色目标（`false` = 填充，`true` = 描边）；无填充的工具强制返回 `true`。
+    fn effective_target_stroke(&self) -> bool {
+        let (_, sup_fill, sup_stroke) = self.active_color_mode_flags();
+        if !sup_fill && sup_stroke {
+            true
+        } else if sup_fill && !sup_stroke {
+            false
+        } else {
+            self.color_target_stroke
+        }
+    }
+
+    /// 当前激活目标的颜色值（用于色板高亮与标题小色块）。
+    fn active_target_color(&self) -> Option<AnnoColor> {
+        let is_stroke = self.effective_target_stroke();
+        if self.is_text_color_context() {
+            if is_stroke {
+                self.text_stroke_color
             } else {
-                rgb(0x3A3A3A)
-            })
-            .text_color(rgb(0xFFFFFF))
-            .child(label)
-            .on_click(move |_, window, cx| {
-                view.update(cx, |this, cx| this.handle(action, window, cx));
-            })
+                Some(self.color)
+            }
+        } else if is_stroke {
+            if self.anno_has_stroke {
+                Some(self.color)
+            } else {
+                None
+            }
+        } else {
+            self.anno_fill
+        }
     }
 
-    /// 颜色块（标注排，选中态白色描边）。
+    /// 颜色块（右侧属性栏快捷色板）。
     fn color_swatch(&self, cx: &mut Context<Self>, color: AnnoColor) -> impl IntoElement {
         let view = cx.entity();
-        let selected = self.color == color;
-        let c = color.to_rgpui();
+        let selected = self.active_target_color() == Some(color);
+        let vt = ViewerTheme::current();
         div()
             .id(format!("viewer-color-{}-{}-{}", color.0, color.1, color.2))
-            .w(px(22.))
-            .h(px(22.))
-            .rounded_sm()
+            .w(px(22.0))
+            .h(px(22.0))
+            .rounded_full()
             .cursor_pointer()
-            .bg(c)
+            .bg(color.to_rgpui())
             .border_2()
             .border_color(if selected {
-                rgb(0xFFFFFF)
+                vt.text_primary
             } else {
-                rgb(0x3A3A3A)
+                vt.panel_border
             })
             .on_click(move |_, window, cx| {
                 view.update(cx, |this, cx| {
@@ -720,71 +1182,499 @@ impl ImageViewer {
             })
     }
 
-    /// 底色块（操作排底色开关旁：显示当前底色 + hex，点击用取色器设置底色）。
-    fn bg_swatch(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
-        let c = self.text_bg_color.as_text_bg_rgpui();
-        div()
-            .id("viewer-bg-swatch")
-            .flex()
-            .items_center()
-            .gap_1()
-            .cursor_pointer()
-            .child(
-                div()
-                    .w(px(22.))
-                    .h(px(22.))
-                    .rounded_sm()
-                    .bg(c)
-                    .border_2()
-                    .border_color(if self.picker_for_bg && self.show_color_picker {
-                        rgb(0xFFFFFF)
-                    } else {
-                        rgb(0x3A3A3A)
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xCCCCCC))
-                    .child(self.text_bg_color.to_hex()),
-            )
-            .on_click(move |_, window, cx| {
-                view.update(cx, |this, cx| this.handle(ViewerAction::PickBg, window, cx));
-            })
-    }
-
-    /// 应用标注字色：未手动指定过底色时，底色跟随字色自适应（黑字不配黑底）。
+    /// 应用标注颜色（根据当前是“填充”还是“描边”目标，分别作用于图形与文字）。
     fn apply_anno_color(&mut self, anno: AnnoColor) {
-        self.color = anno;
-        if !self.bg_color_custom {
-            self.text_bg_color = anno.auto_bg();
+        let is_stroke = self.effective_target_stroke();
+        if is_stroke {
+            if self.is_text_color_context() {
+                self.text_stroke_color = Some(anno);
+            } else {
+                self.color = anno;
+                self.anno_has_stroke = true;
+            }
+        } else if self.is_text_color_context() {
+            self.color = anno;
+            if !self.bg_color_custom {
+                self.text_bg_color = anno.auto_bg();
+            }
+        } else {
+            self.anno_fill = Some(anno);
+        }
+        self.sync_hsv_from_color(anno);
+        self.apply_color_to_selected(is_stroke);
+    }
+
+    /// 根据颜色反算更新取色器 HSV 坐标（纯灰/黑/白保留当前色相，避免跳变）。
+    fn sync_hsv_from_color(&mut self, anno: AnnoColor) {
+        let (h, s, v) = rgb_to_hsv(anno);
+        if s > 0.001 {
+            self.picker_hue = h;
+        }
+        self.picker_sat = s;
+        self.picker_val = v;
+    }
+
+    /// 根据当前取色器 HSV 更新填充或描边色（不反向覆盖正在拖动的色相）。
+    fn apply_picker_hsv(&mut self, cx: &mut Context<Self>) {
+        let anno = hsv_to_anno(self.picker_hue, self.picker_sat, self.picker_val);
+        let is_stroke = self.effective_target_stroke();
+        if is_stroke {
+            if self.is_text_color_context() {
+                self.text_stroke_color = Some(anno);
+            } else {
+                self.color = anno;
+                self.anno_has_stroke = true;
+            }
+        } else if self.is_text_color_context() {
+            self.color = anno;
+            if !self.bg_color_custom {
+                self.text_bg_color = anno.auto_bg();
+            }
+        } else {
+            self.anno_fill = Some(anno);
+        }
+        self.apply_color_to_selected(is_stroke);
+        cx.notify();
+    }
+
+    /// 选择工具选中已有元素时，将该元素的颜色、线宽与圆角状态同步到右侧属性栏。
+    fn sync_inspector_from_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(idx) = self.selected else {
+            return;
+        };
+        let Some(shape) = self.shapes.get(idx).cloned() else {
+            return;
+        };
+        match shape {
+            Shape::Pen { color, width, .. }
+            | Shape::Highlighter { color, width, .. }
+            | Shape::Line { color, width, .. }
+            | Shape::Arrow { color, width, .. } => {
+                self.color = color;
+                self.anno_has_stroke = true;
+                self.color_target_stroke = true;
+                self.width = normalize_width(width);
+                self.sync_hsv_from_color(color);
+                let w = self.width;
+                self.width_slider
+                    .update(cx, |state, cx| state.set_value(w, window, cx));
+            }
+            Shape::Rect {
+                color,
+                width,
+                fill,
+                has_stroke,
+                radius,
+                ..
+            } => {
+                self.color = color;
+                self.anno_fill = fill;
+                self.anno_has_stroke = has_stroke;
+                self.anno_rect_radius = radius;
+                self.width = normalize_width(width);
+                if !has_stroke && fill.is_some() {
+                    self.color_target_stroke = false;
+                }
+                if let Some(c) = self.active_target_color() {
+                    self.sync_hsv_from_color(c);
+                }
+                let w = self.width;
+                self.width_slider
+                    .update(cx, |state, cx| state.set_value(w, window, cx));
+                self.rect_radius_slider
+                    .update(cx, |state, cx| state.set_value(radius, window, cx));
+            }
+            Shape::Ellipse {
+                color,
+                width,
+                fill,
+                has_stroke,
+                ..
+            }
+            | Shape::Polygon {
+                color,
+                width,
+                fill,
+                has_stroke,
+                ..
+            } => {
+                self.color = color;
+                self.anno_fill = fill;
+                self.anno_has_stroke = has_stroke;
+                self.width = normalize_width(width);
+                if !has_stroke && fill.is_some() {
+                    self.color_target_stroke = false;
+                }
+                if let Some(c) = self.active_target_color() {
+                    self.sync_hsv_from_color(c);
+                }
+                let w = self.width;
+                self.width_slider
+                    .update(cx, |state, cx| state.set_value(w, window, cx));
+            }
+            Shape::Text {
+                color,
+                size,
+                bg,
+                bg_color,
+                font_family,
+                stroke_color,
+                stroke_width,
+                ..
+            } => {
+                self.color = color;
+                self.text_size = size;
+                self.text_bg = bg;
+                self.text_bg_color = bg_color;
+                self.text_font = font_family;
+                self.text_stroke_color = stroke_color;
+                self.width = normalize_width(stroke_width);
+                self.bg_color_custom = true;
+                self.color_target_stroke = false;
+                self.width_slider
+                    .update(cx, |s, cx| s.set_value(self.width, window, cx));
+                let sz_txt = (size.round() as u32).to_string();
+                self.text_size_input.update(cx, |s, cx| {
+                    if !s.text().eq(sz_txt.as_str()) {
+                        s.set_value(sz_txt, window, cx);
+                    }
+                });
+                self.sync_hsv_from_color(color);
+            }
+            Shape::Mosaic { .. } => {}
         }
     }
 
-    /// 应用文字底色：记为手动指定；编辑中靠提交落盘，未编辑直接写进最近一条并打开底色。
-    fn apply_bg_color(&mut self, anno: AnnoColor, cx: &mut Context<Self>) {
-        self.text_bg_color = anno;
-        self.bg_color_custom = true;
-        if self.text_editing.is_none()
-            && let Some(idx) = latest_text_index(&self.shapes)
+    /// 收集当前选中的全部有效索引（兼容单选 `selected` 与框选多选 `selected_many`）。
+    fn selected_indices(&self) -> Vec<usize> {
+        let len = self.shapes.len();
+        let mut out: Vec<usize> = self
+            .selected_many
+            .iter()
+            .copied()
+            .filter(|&i| i < len)
+            .collect();
+        if let Some(i) = self.selected
+            && i < len
+            && !out.contains(&i)
         {
-            if let Shape::Text { bg, bg_color, .. } = &mut self.shapes[idx] {
-                *bg_color = anno;
-                *bg = true;
-            }
-            self.text_bg = true;
-            self.redo_stack.clear();
-            // 底色已变更，后续 Esc / 关窗需提示保存。
-            self.dirty = true;
-            let msg = tr("viewer.bg_color_applied");
-            self.set_viewer_status(&msg, cx);
+            out.push(i);
         }
+        out
+    }
+
+    /// 清空单选与多选状态。
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.selected_many.clear();
+    }
+
+    /// 全选画布上所有已标注元素（Ctrl+A）。
+    fn select_all_shapes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shapes.is_empty() {
+            self.clear_selection();
+            cx.notify();
+            return;
+        }
+        // 若此前处于局部变换模式，先结束旧变换再全选，避免变换快照只覆盖部分元素。
+        if !self.transform_originals.is_empty() {
+            self.end_transform(false);
+        }
+        self.tool = AnnoTool::Select;
+        self.marquee = None;
+        self.selected_many = (0..self.shapes.len()).collect();
+        self.selected = self.selected_many.last().copied();
+        self.sync_inspector_from_selected(window, cx);
+        self.set_viewer_status(&format!("已全选 {} 个元素", self.selected_many.len()), cx);
+        cx.notify();
+    }
+
+    /// 若当前有选中已有元素（支持多选），则将填充或描边实时写回全部选中元素。
+    fn apply_color_to_selected(&mut self, is_stroke: bool) -> bool {
+        let indices = self.selected_indices();
+        if indices.is_empty() {
+            return false;
+        }
+        let next_color = self.color;
+        let next_fill = self.anno_fill;
+        let next_text_stroke = self.text_stroke_color;
+        let auto_bg = next_color.auto_bg();
+        let custom_bg = self.bg_color_custom;
+        let mut changed = false;
+        for idx in indices {
+            let Some(shape) = self.shapes.get_mut(idx) else {
+                continue;
+            };
+            if is_stroke {
+                match shape {
+                    Shape::Pen { color, .. }
+                    | Shape::Highlighter { color, .. }
+                    | Shape::Line { color, .. }
+                    | Shape::Arrow { color, .. } => {
+                        *color = next_color;
+                        changed = true;
+                    }
+                    Shape::Polygon {
+                        color, has_stroke, ..
+                    }
+                    | Shape::Rect {
+                        color, has_stroke, ..
+                    }
+                    | Shape::Ellipse {
+                        color, has_stroke, ..
+                    } => {
+                        *color = next_color;
+                        *has_stroke = true;
+                        changed = true;
+                    }
+                    Shape::Text { stroke_color, .. } => {
+                        *stroke_color = next_text_stroke;
+                        changed = true;
+                    }
+                    Shape::Mosaic { .. } => {}
+                }
+            } else {
+                match shape {
+                    Shape::Polygon { fill, .. }
+                    | Shape::Rect { fill, .. }
+                    | Shape::Ellipse { fill, .. } => {
+                        *fill = next_fill;
+                        changed = true;
+                    }
+                    Shape::Text {
+                        color, bg_color, ..
+                    } => {
+                        *color = next_color;
+                        if !custom_bg {
+                            *bg_color = auto_bg;
+                        }
+                        changed = true;
+                    }
+                    Shape::Pen { .. }
+                    | Shape::Highlighter { .. }
+                    | Shape::Line { .. }
+                    | Shape::Arrow { .. }
+                    | Shape::Mosaic { .. } => {}
+                }
+            }
+        }
+        if changed {
+            self.redo_stack.clear();
+        }
+        changed
+    }
+
+    /// 若当前有选中已有图形（支持多选），则将当前线宽实时写回全部选中图形（含文字描边粗细）。
+    fn apply_width_to_selected(&mut self) {
+        let indices = self.selected_indices();
+        let width_val = self.width;
+        for idx in indices {
+            let Some(shape) = self.shapes.get_mut(idx) else {
+                continue;
+            };
+            match shape {
+                Shape::Pen { width, .. }
+                | Shape::Highlighter { width, .. }
+                | Shape::Polygon { width, .. }
+                | Shape::Rect { width, .. }
+                | Shape::Ellipse { width, .. }
+                | Shape::Line { width, .. }
+                | Shape::Arrow { width, .. } => {
+                    *width = width_val;
+                }
+                Shape::Text { stroke_width, .. } => {
+                    *stroke_width = width_val;
+                }
+                Shape::Mosaic { .. } => {}
+            }
+        }
+    }
+
+    /// 若当前有选中矩形（支持多选），则将当前圆角半径实时写回全部选中矩形。
+    fn apply_rect_radius_to_selected(&mut self) {
+        let indices = self.selected_indices();
+        let radius_val = self.anno_rect_radius;
+        for idx in indices {
+            if let Some(Shape::Rect { radius, .. }) = self.shapes.get_mut(idx) {
+                *radius = radius_val;
+                self.redo_stack.clear();
+            }
+        }
+    }
+
+    /// Shift+X 互换填充与描边（仅对矩形、椭圆与多边形有效）。
+    fn swap_fill_stroke(&mut self, cx: &mut Context<Self>) {
+        let indices = self.selected_indices();
+        let mut swapped_any = false;
+        if !indices.is_empty() {
+            for idx in &indices {
+                if let Some(
+                    Shape::Rect {
+                        color,
+                        fill,
+                        has_stroke,
+                        ..
+                    }
+                    | Shape::Ellipse {
+                        color,
+                        fill,
+                        has_stroke,
+                        ..
+                    }
+                    | Shape::Polygon {
+                        color,
+                        fill,
+                        has_stroke,
+                        ..
+                    },
+                ) = self.shapes.get_mut(*idx)
+                {
+                    let old_fill = *fill;
+                    let old_stroke = if *has_stroke { Some(*color) } else { None };
+                    *fill = old_stroke;
+                    if let Some(c) = old_fill {
+                        *color = c;
+                        *has_stroke = true;
+                    } else {
+                        *has_stroke = false;
+                    }
+                    swapped_any = true;
+                }
+            }
+            if !swapped_any {
+                return;
+            }
+            self.redo_stack.clear();
+        } else if !matches!(self.tool, AnnoTool::Rect | AnnoTool::Ellipse) {
+            return;
+        }
+        let old_fill = self.anno_fill;
+        let old_stroke = if self.anno_has_stroke {
+            Some(self.color)
+        } else {
+            None
+        };
+        self.anno_fill = old_stroke;
+        if let Some(c) = old_fill {
+            self.color = c;
+            self.anno_has_stroke = true;
+        } else {
+            self.anno_has_stroke = false;
+        }
+        self.color_target_stroke = !self.color_target_stroke;
+        if let Some(c) = self.active_target_color() {
+            self.sync_hsv_from_color(c);
+        }
+        self.set_viewer_status("已互换填充与描边", cx);
+        cx.notify();
+    }
+
+    /// 清除当前目标的可选颜色（填充或描边，或文字描边）。
+    fn clear_optional_color(&mut self, cx: &mut Context<Self>) {
+        let is_stroke = self.effective_target_stroke();
+        let indices = self.selected_indices();
+        if self.is_text_color_context() && is_stroke {
+            self.text_stroke_color = None;
+            for idx in indices {
+                if let Some(Shape::Text { stroke_color, .. }) = self.shapes.get_mut(idx) {
+                    *stroke_color = None;
+                    self.redo_stack.clear();
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if !is_stroke {
+            self.anno_fill = None;
+            for idx in indices {
+                if let Some(
+                    Shape::Rect { fill, .. }
+                    | Shape::Ellipse { fill, .. }
+                    | Shape::Polygon { fill, .. },
+                ) = self.shapes.get_mut(idx)
+                {
+                    *fill = None;
+                    self.redo_stack.clear();
+                }
+            }
+            cx.notify();
+        } else {
+            self.anno_has_stroke = false;
+            for idx in indices {
+                if let Some(
+                    Shape::Rect { has_stroke, .. }
+                    | Shape::Ellipse { has_stroke, .. }
+                    | Shape::Polygon { has_stroke, .. },
+                ) = self.shapes.get_mut(idx)
+                {
+                    *has_stroke = false;
+                    self.redo_stack.clear();
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// 多选对齐：按选中元素的整体外包盒执行顶 / 左 / 底 / 右 / 水平居中 / 垂直居中对齐。
+    fn align_selected(&mut self, mode: AlignMode, cx: &mut Context<Self>) {
+        let indices = self.selected_indices();
+        if indices.len() < 2 {
+            return;
+        }
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        let boxes: Vec<(usize, PixelRect)> = indices
+            .iter()
+            .filter_map(|&idx| {
+                let s = self.shapes.get(idx)?;
+                let b = shape_align_bbox(s);
+                min_x = min_x.min(b.x);
+                min_y = min_y.min(b.y);
+                max_x = max_x.max(b.x + b.w);
+                max_y = max_y.max(b.y + b.h);
+                Some((idx, b))
+            })
+            .collect();
+        if boxes.len() < 2 {
+            return;
+        }
+        let union_cx = (min_x + max_x) * 0.5;
+        let union_cy = (min_y + max_y) * 0.5;
+        for (idx, b) in boxes {
+            let (dx, dy) = match mode {
+                AlignMode::Top => (0.0, min_y - b.y),
+                AlignMode::Left => (min_x - b.x, 0.0),
+                AlignMode::Bottom => (0.0, max_y - (b.y + b.h)),
+                AlignMode::Right => (max_x - (b.x + b.w), 0.0),
+                AlignMode::CenterH => (union_cx - (b.x + b.w * 0.5), 0.0),
+                AlignMode::CenterV => (0.0, union_cy - (b.y + b.h * 0.5)),
+            };
+            if (dx.abs() > 1e-3 || dy.abs() > 1e-3)
+                && let Some(shape) = self.shapes.get_mut(idx)
+            {
+                translate_shape_by(shape, dx, dy);
+            }
+        }
+        self.redo_stack.clear();
+        let label = match mode {
+            AlignMode::Top => "已顶对齐",
+            AlignMode::Left => "已左对齐",
+            AlignMode::Bottom => "已底对齐",
+            AlignMode::Right => "已右对齐",
+            AlignMode::CenterH => "已水平居中",
+            AlignMode::CenterV => "已垂直居中",
+        };
+        self.set_viewer_status(label, cx);
         cx.notify();
     }
 
     /// 工具条动作分发（按钮与快捷键共用）。
     fn handle(&mut self, action: ViewerAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         match action {
             ViewerAction::ZoomIn => self.zoom_by(ZOOM_STEP, cx),
             ViewerAction::ZoomOut => self.zoom_by(1.0 / ZOOM_STEP, cx),
@@ -793,18 +1683,20 @@ impl ImageViewer {
                 self.offset = (0.0, 0.0);
                 cx.notify();
             }
-            ViewerAction::Copy => self.copy_image(cx),
-            ViewerAction::Ocr => self.run_ocr(cx),
-            ViewerAction::OcrCopyAll => self.copy_ocr_lines(cx),
-            ViewerAction::OcrSelectLine(i) => self.select_ocr_line(i, cx),
-            ViewerAction::OcrApply => self.apply_ocr_lines(cx),
-            ViewerAction::CloseOcrPanel => {
-                // 收起面板与提取层，选中一并清除，再点识别会被新结果替换。
-                self.show_ocr_panel = false;
-                self.selected_ocr = None;
-                cx.notify();
+            ViewerAction::Copy => {
+                self.end_transform(false);
+                if self.text_editing.is_some() {
+                    self.commit_text(window, cx);
+                }
+                self.on_anno_up(None, cx);
+                self.copy_image(cx);
             }
             ViewerAction::Save => {
+                self.end_transform(false);
+                if self.text_editing.is_some() {
+                    self.commit_text(window, cx);
+                }
+                self.on_anno_up(None, cx);
                 // 工具条保存只管落盘，返回值（成功与否）由状态栏反馈。
                 let _ = self.save_image(cx);
             }
@@ -813,9 +1705,29 @@ impl ImageViewer {
                 if self.text_editing.is_some() {
                     self.commit_text(window, cx);
                 }
+                if tool == AnnoTool::Eyedropper && self.tool != AnnoTool::Eyedropper {
+                    self.sample_return_tool = self.tool;
+                }
+                self.end_transform(false);
+                self.clear_selection();
                 self.tool = tool;
+                // 直线 / 箭头 / 画笔 / 荧光笔没有填充，默认切到描边；文字默认切到填充。
+                match tool {
+                    AnnoTool::Line | AnnoTool::Arrow | AnnoTool::Pen | AnnoTool::Highlighter => {
+                        self.color_target_stroke = true;
+                    }
+                    AnnoTool::Text => {
+                        self.color_target_stroke = false;
+                    }
+                    _ => {}
+                }
+                if let Some(c) = self.active_target_color() {
+                    self.sync_hsv_from_color(c);
+                }
                 self.draft = None;
                 self.anchor = None;
+                self.draft_end = None;
+                self.draft_last = None;
                 self.drag_text = None;
                 self.drag_shape = None;
                 self.erasing = false;
@@ -831,17 +1743,24 @@ impl ImageViewer {
             ViewerAction::WidthNudge(delta) => self.nudge_width(delta, window, cx),
             ViewerAction::TextBg => {
                 // 按条独立，但保证每次点击都可见生效：
-                // 编辑中只翻本次提交用的开关（编辑框实时预览）；
-                // 未编辑则同步翻转最近一条文字的底色（旧文字互不影响），无文字时只切新建默认。
+                // 有选中文字时直接修改所选文字；否则编辑中预览或修改最近一条。
                 self.text_bg = !self.text_bg;
-                if self.text_editing.is_none()
+                let indices = self.selected_indices();
+                let mut updated_selected = false;
+                for idx in indices {
+                    if let Some(Shape::Text { bg, .. }) = self.shapes.get_mut(idx) {
+                        *bg = self.text_bg;
+                        updated_selected = true;
+                    }
+                }
+                if updated_selected {
+                    self.redo_stack.clear();
+                } else if self.text_editing.is_none()
                     && let Some(idx) = latest_text_index(&self.shapes)
                     && let Shape::Text { bg, .. } = &mut self.shapes[idx]
                 {
                     *bg = self.text_bg;
                     self.redo_stack.clear();
-                    // 底色已变更，后续 Esc / 关窗需提示保存。
-                    self.dirty = true;
                     let msg = tr("viewer.text_bg_latest");
                     self.set_viewer_status(&msg, cx);
                 } else if self.text_editing.is_none() {
@@ -850,16 +1769,71 @@ impl ImageViewer {
                 }
                 cx.notify();
             }
-            ViewerAction::ToggleColorPicker => {
-                // 取色按钮固定是字色目标，底色走底色块。
-                self.picker_for_bg = false;
-                self.show_color_picker = !self.show_color_picker;
+            ViewerAction::TextSizeNudge(delta) => {
+                let next_sz = (self.text_size + delta).clamp(12.0, 120.0).round();
+                self.text_size = next_sz;
+                if let Some(editing) = &mut self.text_editing {
+                    editing.size = next_sz;
+                }
+                for idx in self.selected_indices() {
+                    if let Some(Shape::Text { size, .. }) = self.shapes.get_mut(idx) {
+                        *size = next_sz;
+                        self.redo_stack.clear();
+                    }
+                }
+                let txt = (next_sz as u32).to_string();
+                self.text_size_input.update(cx, |s, cx| {
+                    if !s.text().eq(txt.as_str()) {
+                        s.set_value(txt, window, cx);
+                    }
+                });
                 cx.notify();
             }
-            ViewerAction::PickBg => {
-                // 底色块：取色器切到底色目标并展开，拖动实时改底色。
-                self.picker_for_bg = true;
-                self.show_color_picker = true;
+            ViewerAction::TextFont(family) => {
+                self.text_font = family.clone();
+                self.font_dropdown_open = false;
+                if let Some(editing) = &mut self.text_editing {
+                    editing.font_family = family.clone();
+                }
+                for idx in self.selected_indices() {
+                    if let Some(Shape::Text { font_family, .. }) = self.shapes.get_mut(idx) {
+                        *font_family = family.clone();
+                        self.redo_stack.clear();
+                    }
+                }
+                cx.notify();
+            }
+            ViewerAction::ToggleFontDropdown => {
+                self.font_dropdown_open = !self.font_dropdown_open;
+                cx.notify();
+            }
+            ViewerAction::PickBg(is_stroke) => {
+                self.color_target_stroke = is_stroke;
+                if let Some(target) = self.active_target_color() {
+                    self.sync_hsv_from_color(target);
+                }
+                cx.notify();
+            }
+            ViewerAction::SwapFillStroke => self.swap_fill_stroke(cx),
+            ViewerAction::ClearOptionalColor => self.clear_optional_color(cx),
+            ViewerAction::RectRadiusNudge(delta) => {
+                self.anno_rect_radius = (self.anno_rect_radius + delta).clamp(0.0, 64.0).round();
+                self.apply_rect_radius_to_selected();
+                let r = self.anno_rect_radius;
+                self.rect_radius_slider
+                    .update(cx, |s, cx| s.set_value(r, window, cx));
+                cx.notify();
+            }
+            ViewerAction::Align(mode) => self.align_selected(mode, cx),
+            ViewerAction::ToggleDock => {
+                self.dock_compact = !self.dock_compact;
+                cx.notify();
+            }
+            ViewerAction::ToggleTheme => {
+                let next_dark = !crate::app::is_dark_mode();
+                crate::config::update(|cfg| cfg.dark_mode = Some(next_dark));
+                crate::app::apply_theme(cx);
+                self.main.update(cx, |_, cx| cx.notify());
                 cx.notify();
             }
             ViewerAction::OpenSavedFile => {
@@ -876,38 +1850,36 @@ impl ImageViewer {
                     cx.open_with_system(dir);
                 }
             }
-            ViewerAction::ConfirmSaveClose => self.save_and_close(window, cx),
-            ViewerAction::ConfirmDiscardClose => window.remove_window(),
-            ViewerAction::CancelCloseConfirm => {
-                // 取消关闭：收起确认浮层，留在窗口继续编辑。
-                self.confirm_close = false;
-                cx.notify();
-            }
+            ViewerAction::Transform => self.begin_transform(window, cx),
+            ViewerAction::Pin => self.pin_and_close(window, cx),
+            ViewerAction::Close => self.copy_and_close(window, cx),
         }
     }
 
     /// 撤销一个标注（进重做栈）。
     fn undo(&mut self, cx: &mut Context<Self>) {
+        self.end_transform(false);
+        self.clear_selection();
         if let Some(shape) = self.shapes.pop() {
             self.redo_stack.push(shape);
-            // 标注集合已变更，后续 Esc 关窗需提示保存。
-            self.dirty = true;
             cx.notify();
         }
     }
 
     /// 重做一个标注（从重做栈取回）。
     fn redo(&mut self, cx: &mut Context<Self>) {
+        self.end_transform(false);
+        self.clear_selection();
         if let Some(shape) = self.redo_stack.pop() {
             self.shapes.push(shape);
-            // 标注集合已变更，后续 Esc 关窗需提示保存。
-            self.dirty = true;
             cx.notify();
         }
     }
 
     /// 橡皮擦删除落点命中的标注（一次删光重叠的，删后清空重做栈）。
     fn erase_at(&mut self, p: (f32, f32), cx: &mut Context<Self>) {
+        self.end_transform(false);
+        self.clear_selection();
         let mut removed = false;
         while let Some(idx) = erase_hit(&self.shapes, p, ERASER_RADIUS) {
             self.shapes.remove(idx);
@@ -915,8 +1887,6 @@ impl ImageViewer {
         }
         if removed {
             self.redo_stack.clear();
-            // 删掉了已提交的标注，后续 Esc 关窗需提示保存。
-            self.dirty = true;
             cx.notify();
         }
     }
@@ -933,9 +1903,9 @@ impl ImageViewer {
         let dh = self.preview.h as f32 * self.zoom;
         let left = (self.area_w - dw) / 2.0 + self.offset.0;
         let top = (self.area_h - dh) / 2.0 + self.offset.1;
-        // 图片左上角在窗口中的位置：x = left，y = 工具栏高 + top。
+        // 全幅画布直接从窗口原点起算。
         let img_left = left;
-        let img_top = TOOLBAR_H + top;
+        let img_top = top;
         Some((
             (pos.x.as_f32() - img_left) / self.zoom,
             (pos.y.as_f32() - img_top) / self.zoom,
@@ -951,6 +1921,78 @@ impl ImageViewer {
     fn can_pan(&self) -> bool {
         self.preview.w as f32 * self.zoom > self.area_w
             || self.preview.h as f32 * self.zoom > self.area_h
+    }
+
+    /// 切换到文字工具并进入指定文字元素的重新编辑模式。
+    fn begin_edit_text_index(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if idx >= self.shapes.len() || !matches!(self.shapes.get(idx), Some(Shape::Text { .. })) {
+            return false;
+        }
+        let old = self.shapes.remove(idx);
+        self.tool = AnnoTool::Text;
+        self.clear_selection();
+        self.drag_shape = None;
+        self.marquee = None;
+        if let Shape::Text {
+            pos,
+            content,
+            color,
+            bg,
+            bg_color,
+            size,
+            max_w,
+            font_family,
+            stroke_color,
+            stroke_width,
+        } = old
+        {
+            self.color = color;
+            self.text_size = size;
+            self.text_font = font_family.clone();
+            self.text_stroke_color = stroke_color;
+            self.width = normalize_width(stroke_width);
+            self.text_bg = bg;
+            self.text_bg_color = bg_color;
+            self.bg_color_custom = true;
+            self.color_target_stroke = false;
+            self.width_slider
+                .update(cx, |s, cx| s.set_value(self.width, window, cx));
+            let sz_txt = (size.round() as u32).to_string();
+            self.text_size_input.update(cx, |s, cx| {
+                if !s.text().eq(sz_txt.as_str()) {
+                    s.set_value(sz_txt, window, cx);
+                }
+            });
+            self.sync_hsv_from_color(color);
+            let input = cx.new(|cx| {
+                if max_w.is_some() {
+                    InputState::new(window, cx).auto_grow(1, 64).soft_wrap(true)
+                } else {
+                    InputState::new(window, cx)
+                }
+            });
+            input.update(cx, |state, cx| {
+                state.set_value(content, window, cx);
+            });
+            cx.observe(&input, |_, _, cx| cx.notify()).detach();
+            self.text_editing = Some(TextEdit {
+                img_pos: pos,
+                size,
+                max_w,
+                font_family,
+                input,
+                edit_index: Some(idx),
+            });
+            self.focus_text_next_frame(window, cx);
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     /// 查找最顶层命中指定图片像素点的文字标注索引（从后往前找，后画的在上层）。
@@ -982,24 +2024,129 @@ impl ImageViewer {
     /// 左键按下：空格平移优先，选择工具优先移动标注，空白处平移；其他工具开始绘制。
     fn on_anno_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // 空格按住时左键拖拽一律平移，与当前工具无关（默认矩形下放大看图用）。
+        if !self.transform_originals.is_empty()
+            && let Some(point) = self.to_image(ev.position)
+        {
+            if let Some(bounds) = self.transform_group_bounds(window)
+                && let Some(handle) = transform_hit(bounds, point, self.zoom)
+            {
+                let sources: Vec<(usize, Shape, PixelRect)> = self
+                    .transform_originals
+                    .iter()
+                    .filter_map(|&(idx, _)| {
+                        let shape = self.shapes.get(idx)?.clone();
+                        let rect = self.shape_transform_bounds(idx, window)?;
+                        Some((idx, shape, rect))
+                    })
+                    .collect();
+                self.transform_drag = Some(TransformDrag {
+                    handle,
+                    bounds,
+                    sources,
+                    start: point,
+                });
+                return;
+            }
+            self.end_transform(false);
+        }
         if self.space_held {
             self.on_pan_down(ev, cx);
             return;
         }
+        if self.closing {
+            return;
+        }
+        if self.tool == AnnoTool::Eyedropper {
+            self.eyedropper_dragging = true;
+            if let Some(p) = self.to_image(ev.position)
+                && let Some(color) = self
+                    .base_image
+                    .as_ref()
+                    .and_then(|image| sample_image_color(image, p))
+            {
+                self.apply_anno_color(color);
+                self.set_viewer_status(&format!("{} {}", tr("viewer.sampled"), color.to_hex()), cx);
+            }
+            return;
+        }
         if self.tool == AnnoTool::Select {
-            // 如果点中已有标注，选择工具用于移动标注；点空白处才平移图片。
-            if let Some(p) = self.to_image(ev.position).filter(|p| self.in_image(*p))
+            // 双击文字元素：自动切换到文字工具并进入重新编辑模式（允许命中画布外元素）。
+            if ev.click_count >= 2
+                && let Some(p) = self.to_image(ev.position)
+                && let Some(idx) = self.hit_test_text(p)
+            {
+                if self.text_editing.is_some() {
+                    self.commit_text(window, cx);
+                }
+                if self.begin_edit_text_index(idx, window, cx) {
+                    return;
+                }
+            }
+            // 如果点中已有标注（含已移出画布外的元素），支持 Shift 切换多选或整体拖动已选组；点空白处框选。
+            if let Some(p) = self.to_image(ev.position)
                 && let Some(idx) = self.hit_test_shape(p)
             {
                 if self.text_editing.is_some() {
                     self.commit_text(window, cx);
                 }
+                if ev.modifiers.shift {
+                    if let Some(pos) = self.selected_many.iter().position(|&i| i == idx) {
+                        self.selected_many.remove(pos);
+                        self.selected = self.selected_many.last().copied();
+                    } else {
+                        if let Some(cur) = self.selected
+                            && !self.selected_many.contains(&cur)
+                        {
+                            self.selected_many.push(cur);
+                        }
+                        self.selected_many.push(idx);
+                        self.selected = Some(idx);
+                    }
+                    self.sync_inspector_from_selected(window, cx);
+                    cx.notify();
+                    return;
+                }
+                if !self.selected_many.contains(&idx) {
+                    self.selected_many = vec![idx];
+                }
+                if ev.modifiers.alt {
+                    // Alt+拖动：复制当前选中的元素组，并直接拖动新副本。
+                    let mut group = self.selected_indices();
+                    if group.is_empty() {
+                        group.push(idx);
+                    }
+                    let mut new_indices = Vec::with_capacity(group.len());
+                    for src_i in group {
+                        if let Some(cloned) = self.shapes.get(src_i).cloned() {
+                            self.shapes.push(cloned);
+                            new_indices.push(self.shapes.len() - 1);
+                        }
+                    }
+                    if let Some(&last_new) = new_indices.last() {
+                        self.selected_many = new_indices;
+                        self.selected = Some(last_new);
+                        self.sync_inspector_from_selected(window, cx);
+                        self.drag_shape = Some(DragShape {
+                            idx: last_new,
+                            last: p,
+                        });
+                        self.redo_stack.clear();
+                        cx.notify();
+                        return;
+                    }
+                }
+                self.selected = Some(idx);
+                self.sync_inspector_from_selected(window, cx);
                 self.drag_shape = Some(DragShape { idx, last: p });
                 self.redo_stack.clear();
                 cx.notify();
                 return;
             }
-            self.on_pan_down(ev, cx);
+            self.clear_selection();
+            if let Some(p) = self.to_image(ev.position) {
+                self.marquee = Some((p.0, p.1, p.0, p.1));
+            }
+            cx.notify();
             return;
         }
         // 橡皮擦：按下即删落点标注，拖动持续删除（抬起结束）。
@@ -1039,63 +2186,43 @@ impl ImageViewer {
                 }
             }
             // 点击已有文字 → 进入重新编辑模式。
-            if let Some(idx) = self.hit_test_text(p) {
-                let old = self.shapes.remove(idx);
-                // 原文字已从画布取下（取消编辑也会丢失），先记为脏。
-                self.dirty = true;
-                if let Shape::Text {
-                    pos,
-                    content,
-                    color,
-                    bg,
-                    bg_color,
-                    ..
-                } = old
-                {
-                    self.color = color;
-                    // 开关与底色跟随该条文字的旧值，改完提交只影响这一条。
-                    self.text_bg = bg;
-                    self.text_bg_color = bg_color;
-                    self.bg_color_custom = true;
-                    let input = cx.new(|cx| {
-                        InputState::new(window, cx).placeholder(tr("viewer.text_placeholder"))
-                    });
-                    // 用已有文字填充输入框。
-                    input.update(cx, |state, cx| {
-                        state.set_value(content.clone(), window, cx);
-                    });
-                    let container_pos = (pos.0 * self.zoom, pos.1 * self.zoom);
-                    self.text_editing = Some(TextEdit {
-                        img_pos: pos,
-                        input,
-                        container_pos,
-                        edit_index: Some(idx),
-                    });
-                    if let Some(editing) = &self.text_editing {
-                        editing
-                            .input
-                            .update(cx, |state, cx| state.focus(window, cx));
-                    }
-                    cx.notify();
-                    return;
-                }
+            if let Some(idx) = self.hit_test_text(p)
+                && self.begin_edit_text_index(idx, window, cx)
+            {
+                return;
             }
-            // 普通点击：新建文字。
-            self.place_text(p, window, cx);
+            // 空白处按下：暂存拉框起点（松手时判断是单击单行输入还是拉出自动换行文本框）。
+            self.clear_selection();
+            self.text_box_draft = Some((p.0, p.1, p.0, p.1));
+            cx.notify();
             return;
         }
 
         // ── 图形类工具：开始绘制草稿 ──
+        self.clear_selection();
         let (color, width) = (self.color, self.width);
         self.anchor = Some(p);
+        self.draft_end = Some(p);
+        self.draft_last = Some(p);
         self.draft = Some(match self.tool {
             AnnoTool::Rect => Shape::Rect {
                 rect: PixelRect::from_points(p, p),
                 color,
                 width,
+                fill: self.anno_fill,
+                has_stroke: self.anno_has_stroke,
+                radius: self.anno_rect_radius,
             },
             AnnoTool::Ellipse => Shape::Ellipse {
                 rect: PixelRect::from_points(p, p),
+                color,
+                width,
+                fill: self.anno_fill,
+                has_stroke: self.anno_has_stroke,
+            },
+            AnnoTool::Line => Shape::Line {
+                from: p,
+                to: p,
                 color,
                 width,
             },
@@ -1118,13 +2245,92 @@ impl ImageViewer {
             AnnoTool::Mosaic => Shape::Mosaic {
                 rect: PixelRect::from_points(p, p),
             },
-            AnnoTool::Select | AnnoTool::Text | AnnoTool::Eraser => return,
+            AnnoTool::Select | AnnoTool::Text | AnnoTool::Eraser | AnnoTool::Eyedropper => return,
         });
         cx.notify();
     }
 
     /// 鼠标移动：移动标注、Ctrl+拖动文字、平移（选择 / 空格 / 中键）、其他工具更新草稿。
-    fn on_anno_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+    fn on_anno_move(&mut self, ev: &MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        if !self.transform_originals.is_empty() && self.transform_drag.is_none() {
+            let hover = self
+                .transform_group_bounds(window)
+                .zip(self.to_image(ev.position))
+                .and_then(|(bounds, point)| transform_hit(bounds, point, self.zoom));
+            if self.transform_hover != hover {
+                self.transform_hover = hover;
+                cx.notify();
+            }
+        }
+        if let Some(drag) = &self.transform_drag {
+            if let Some(point) = self.to_image(ev.position) {
+                if drag.handle == TransformHandle::Rotate {
+                    let cx_box = drag.bounds.x + drag.bounds.w / 2.0;
+                    let cy_box = drag.bounds.y + drag.bounds.h / 2.0;
+                    let a0 = (drag.start.1 - cy_box).atan2(drag.start.0 - cx_box);
+                    let a1 = (point.1 - cy_box).atan2(point.0 - cx_box);
+                    let mut delta = a1 - a0;
+                    if ev.modifiers.shift {
+                        let step = std::f32::consts::PI / 12.0; // Shift 约束每 15° 一档（含 45°/90°/135°）
+                        delta = (delta / step).round() * step;
+                    }
+                    for &(idx, ref src_shape, _) in &drag.sources {
+                        if let Some(dst) = self.shapes.get_mut(idx) {
+                            *dst = rotate_shape(src_shape, (cx_box, cy_box), delta);
+                        }
+                    }
+                    self.transform_frame = None;
+                    let deg = delta.to_degrees().round() as i32;
+                    self.set_viewer_status(&format!("旋转：{deg}°"), cx);
+                    self.redo_stack.clear();
+                    cx.notify();
+                    return;
+                }
+                let has_point_text = drag
+                    .sources
+                    .iter()
+                    .any(|(_, s, _)| matches!(s, Shape::Text { max_w: None, .. }));
+                let keep_aspect = ev.modifiers.shift
+                    || (drag.sources.len() == 1
+                        && matches!(drag.sources[0].1, Shape::Text { max_w: None, .. }));
+                let target = resize_bounds(
+                    drag.bounds,
+                    (point.0 - drag.start.0, point.1 - drag.start.1),
+                    drag.handle,
+                    keep_aspect,
+                );
+                let sx = target.w / drag.bounds.w.max(1.0);
+                let sy = target.h / drag.bounds.h.max(1.0);
+                for &(idx, ref src_shape, src_rect) in &drag.sources {
+                    let sub_target = PixelRect::new(
+                        target.x + (src_rect.x - drag.bounds.x) * sx,
+                        target.y + (src_rect.y - drag.bounds.y) * sy,
+                        (src_rect.w * sx).max(1.0),
+                        (src_rect.h * sy).max(1.0),
+                    );
+                    if let Some(dst) = self.shapes.get_mut(idx) {
+                        *dst = transform_shape(src_shape, src_rect, sub_target, has_point_text);
+                    }
+                }
+                self.transform_frame = Some(target);
+                self.redo_stack.clear();
+                cx.notify();
+            }
+            return;
+        }
+        // 吸管拖动中：实时取样原图像素色。
+        if self.eyedropper_dragging {
+            if let Some(p) = self.to_image(ev.position)
+                && let Some(color) = self
+                    .base_image
+                    .as_ref()
+                    .and_then(|image| sample_image_color(image, p))
+            {
+                self.apply_anno_color(color);
+                self.set_viewer_status(&format!("{} {}", tr("viewer.sampled"), color.to_hex()), cx);
+            }
+            return;
+        }
         // 橡皮擦拖动中：沿途删除命中的标注。
         if self.erasing {
             if let Some(p) = self.to_image(ev.position).filter(|p| self.in_image(*p)) {
@@ -1132,40 +2338,59 @@ impl ImageViewer {
             }
             return;
         }
-        // 选择工具拖动标注：按图片像素增量平移，并尽量限制在图内。
-        if self.drag_shape.is_some() {
-            let Some(mut p) = self.to_image(ev.position) else {
-                return;
-            };
-            p.0 = p.0.clamp(0.0, self.preview.w as f32);
-            p.1 = p.1.clamp(0.0, self.preview.h as f32);
-            let Some(drag) = &mut self.drag_shape else {
-                return;
-            };
-            let delta = (p.0 - drag.last.0, p.1 - drag.last.1);
-            if delta.0 != 0.0 || delta.1 != 0.0 {
-                if let Some(shape) = self.shapes.get_mut(drag.idx) {
-                    move_shape_clamped(shape, delta, self.preview.w as f32, self.preview.h as f32);
-                }
-                drag.last = p;
-                // 标注位置已变更，后续 Esc 关窗需提示保存。
-                self.dirty = true;
+        // 文本工具拖动中：更新自动换行文本框预览矩形。
+        if let Some((sx, sy, _, _)) = self.text_box_draft {
+            if let Some(p) = self.to_image(ev.position) {
+                let p = (
+                    p.0.clamp(0.0, self.preview.w as f32),
+                    p.1.clamp(0.0, self.preview.h as f32),
+                );
+                self.text_box_draft = Some((sx, sy, p.0, p.1));
                 cx.notify();
             }
             return;
         }
-        // Ctrl+拖动文字：直接更新已有文字坐标。
-        if let Some(drag) = &self.drag_text {
-            let Some(mut p) = self.to_image(ev.position) else {
+        // 选择工具框选拖动中：更新虚线选框终点。
+        if let Some((sx, sy, _, _)) = self.marquee {
+            if let Some(p) = self.to_image(ev.position) {
+                self.marquee = Some((sx, sy, p.0, p.1));
+                cx.notify();
+            }
+            return;
+        }
+        // 选择工具拖动标注：按图片像素增量自由平移（支持多选整组一起移出画布之外）。
+        if self.drag_shape.is_some() {
+            let Some(p) = self.to_image(ev.position) else {
                 return;
             };
-            p.0 = p.0.clamp(0.0, self.preview.w as f32);
-            p.1 = p.1.clamp(0.0, self.preview.h as f32);
+            let Some(drag) = &mut self.drag_shape else {
+                return;
+            };
+            let delta = (p.0 - drag.last.0, p.1 - drag.last.1);
+            let drag_idx = drag.idx;
+            drag.last = p;
+            if delta.0 != 0.0 || delta.1 != 0.0 {
+                let mut indices = self.selected_indices();
+                if !indices.contains(&drag_idx) {
+                    indices = vec![drag_idx];
+                }
+                for i in indices {
+                    if let Some(shape) = self.shapes.get_mut(i) {
+                        move_shape(shape, delta);
+                    }
+                }
+                cx.notify();
+            }
+            return;
+        }
+        // Ctrl+拖动文字：直接更新已有文字坐标（允许移出画布之外）。
+        if let Some(drag) = &self.drag_text {
+            let Some(p) = self.to_image(ev.position) else {
+                return;
+            };
             if let Some(Shape::Text { pos, .. }) = self.shapes.get_mut(drag.idx) {
-                pos.0 = (p.0 - drag.offset.0).max(0.0);
-                pos.1 = (p.1 - drag.offset.1).max(0.0);
-                // 文字位置已变更，后续 Esc 关窗需提示保存。
-                self.dirty = true;
+                pos.0 = p.0 - drag.offset.0;
+                pos.1 = p.1 - drag.offset.1;
             }
             cx.notify();
             return;
@@ -1175,11 +2400,10 @@ impl ImageViewer {
             self.on_pan_move(ev, cx);
             return;
         }
-        // 选择工具：未按下时仅更新悬停命中，用于显示“可移动标注”的鼠标形状。
+        // 选择工具：未按下时仅更新悬停命中（含画布外元素），用于显示“可移动标注”的鼠标形状。
         if self.tool == AnnoTool::Select {
             let hover_shape = self
                 .to_image(ev.position)
-                .filter(|p| self.in_image(*p))
                 .and_then(|p| self.hit_test_shape(p))
                 .is_some();
             if self.hover_shape != hover_shape {
@@ -1188,23 +2412,62 @@ impl ImageViewer {
             }
             return;
         }
-        let Some(anchor) = self.anchor else {
-            return;
-        };
         let Some(mut p) = self.to_image(ev.position) else {
             return;
         };
         p.0 = p.0.clamp(0.0, self.preview.w as f32);
         p.1 = p.1.clamp(0.0, self.preview.h as f32);
+        let Some(last) = self.draft_last.replace(p) else {
+            return;
+        };
+        let delta = (p.0 - last.0, p.1 - last.1);
+        if self.space_held
+            && let Some(draft) = &mut self.draft
+        {
+            let moved =
+                translate_draft(draft, delta, (self.preview.w as f32, self.preview.h as f32));
+            if let Some(anchor) = &mut self.anchor {
+                anchor.0 += moved.0;
+                anchor.1 += moved.1;
+            }
+            if let Some(end) = &mut self.draft_end {
+                end.0 += moved.0;
+                end.1 += moved.1;
+            }
+            cx.notify();
+            return;
+        }
+        let (Some(anchor), Some(end)) = (self.anchor, self.draft_end.as_mut()) else {
+            return;
+        };
+        let raw_end = (
+            (end.0 + delta.0).clamp(0.0, self.preview.w as f32),
+            (end.1 + delta.1).clamp(0.0, self.preview.h as f32),
+        );
+        *end = raw_end;
+        let p = if ev.modifiers.shift {
+            constrain_draw_point(
+                anchor,
+                raw_end,
+                self.tool,
+                self.preview.w as f32,
+                self.preview.h as f32,
+            )
+        } else {
+            raw_end
+        };
         match &mut self.draft {
             Some(Shape::Rect { rect, .. })
             | Some(Shape::Ellipse { rect, .. })
             | Some(Shape::Mosaic { rect }) => {
                 *rect = PixelRect::from_points(anchor, p);
             }
-            Some(Shape::Arrow { to, .. }) => *to = p,
+            Some(Shape::Line { to, .. }) | Some(Shape::Arrow { to, .. }) => *to = p,
             Some(Shape::Pen { pts, .. }) | Some(Shape::Highlighter { pts, .. }) => {
-                if pts.last() != Some(&p) {
+                if ev.modifiers.shift {
+                    // Shift 下按直线角度约束画笔 / 荧光笔，方便画水平/垂直/45° 直线高亮。
+                    *pts = vec![anchor, p];
+                } else if pts.last() != Some(&p) {
                     pts.push(p);
                 }
             }
@@ -1213,8 +2476,30 @@ impl ImageViewer {
         cx.notify();
     }
 
-    /// 左键抬起：结束移动 / 平移（选择 / 空格 / 中键），Ctrl+拖动文字结束，其他工具提交草稿。
-    fn on_anno_up(&mut self, cx: &mut Context<Self>) {
+    /// 左键抬起：结束移动 / 平移（选择 / 空格 / 中键），Ctrl+拖动文字结束，文本拉框或点击建框，其他工具提交草稿。
+    fn on_anno_up(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.eyedropper_dragging {
+            self.eyedropper_dragging = false;
+            return;
+        }
+        if let Some((sx, sy, ex, ey)) = self.text_box_draft.take() {
+            if let Some(w) = window {
+                let rect = PixelRect::from_points((sx, sy), (ex, ey));
+                if rect.w >= 24.0 || rect.h >= 16.0 {
+                    let box_w = rect.w.max(60.0);
+                    self.place_text((rect.x, rect.y), Some(box_w), w, cx);
+                } else {
+                    self.place_text((sx, sy), None, w, cx);
+                }
+            } else {
+                cx.notify();
+            }
+            return;
+        }
+        if self.transform_drag.take().is_some() {
+            cx.notify();
+            return;
+        }
         // 橡皮擦拖动结束。
         if self.erasing {
             self.erasing = false;
@@ -1236,6 +2521,65 @@ impl ImageViewer {
             self.on_pan_up(cx);
             return;
         }
+        // 选择工具框选结束：收集框内所有相交元素实现多选（单点空白保持取消选中）。
+        if let Some((sx, sy, ex, ey)) = self.marquee.take() {
+            let rect = PixelRect::from_points((sx, sy), (ex, ey));
+            if rect.w > 3.0 || rect.h > 3.0 {
+                let hits: Vec<usize> = self
+                    .shapes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, shape)| {
+                        let b = shape.bbox();
+                        let overlaps = b.x <= rect.x + rect.w
+                            && b.x + b.w >= rect.x
+                            && b.y <= rect.y + rect.h
+                            && b.y + b.h >= rect.y;
+                        overlaps.then_some(i)
+                    })
+                    .collect();
+                self.selected_many = hits;
+                self.selected = self.selected_many.last().copied();
+                if let Some(idx) = self.selected
+                    && let Some(shape) = self.shapes.get(idx).cloned()
+                {
+                    match shape {
+                        Shape::Pen { color, width, .. }
+                        | Shape::Highlighter { color, width, .. }
+                        | Shape::Polygon { color, width, .. }
+                        | Shape::Rect { color, width, .. }
+                        | Shape::Ellipse { color, width, .. }
+                        | Shape::Line { color, width, .. }
+                        | Shape::Arrow { color, width, .. } => {
+                            self.color = color;
+                            self.width = normalize_width(width);
+                            if self.effective_target_stroke() {
+                                self.sync_hsv_from_color(color);
+                            }
+                        }
+                        Shape::Text {
+                            color,
+                            bg,
+                            bg_color,
+                            stroke_color,
+                            ..
+                        } => {
+                            self.color = color;
+                            self.text_bg = bg;
+                            self.text_bg_color = bg_color;
+                            self.text_stroke_color = stroke_color;
+                            self.bg_color_custom = true;
+                            if let Some(target) = self.active_target_color() {
+                                self.sync_hsv_from_color(target);
+                            }
+                        }
+                        Shape::Mosaic { .. } => {}
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         if self.tool == AnnoTool::Select {
             return;
         }
@@ -1244,31 +2588,57 @@ impl ImageViewer {
             && draft_valid(&draft)
         {
             self.shapes.push(draft);
+            let idx = self.shapes.len() - 1;
+            self.selected = Some(idx);
+            self.selected_many = vec![idx];
             self.redo_stack.clear();
-            // 新标注已提交，后续 Esc 关窗需提示保存。
-            self.dirty = true;
         }
         self.anchor = None;
+        self.draft_end = None;
+        self.draft_last = None;
         cx.notify();
     }
 
-    /// 点击后进入文字编辑模式：在图片上创建 inline 输入框。
-    fn place_text(&mut self, img_pos: (f32, f32), window: &mut Window, cx: &mut Context<Self>) {
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(tr("viewer.text_placeholder")));
-        let container_pos = (img_pos.0 * self.zoom, img_pos.1 * self.zoom);
+    /// 点击或拖框后进入文字编辑模式：在图片上创建 inline 输入框。
+    fn place_text(
+        &mut self,
+        img_pos: (f32, f32),
+        max_w: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            if max_w.is_some() {
+                InputState::new(window, cx).auto_grow(1, 64).soft_wrap(true)
+            } else {
+                InputState::new(window, cx)
+            }
+        });
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
         self.text_editing = Some(TextEdit {
             img_pos,
+            size: self.text_size,
+            max_w,
+            font_family: self.text_font.clone(),
             input,
-            container_pos,
             edit_index: None,
         });
-        if let Some(editing) = &self.text_editing {
-            editing
-                .input
-                .update(cx, |state, cx| state.focus(window, cx));
-        }
+        self.focus_text_next_frame(window, cx);
         cx.notify();
+    }
+
+    /// 新输入框先挂载再聚焦，避免创建它的鼠标事件把焦点退回画布。
+    fn focus_text_next_frame(&self, window: &Window, cx: &Context<Self>) {
+        let view = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                if let Some(editing) = &this.text_editing {
+                    editing
+                        .input
+                        .update(cx, |state, cx| state.focus(window, cx));
+                }
+            });
+        });
     }
 
     /// 提交正在编辑的文字：读取内容，放入 shapes。
@@ -1290,190 +2660,51 @@ impl ImageViewer {
             pos: editing.img_pos,
             content,
             color: self.color,
-            size: DEFAULT_TEXT_SIZE,
-            // 提交时快照当前开关，新旧文字各自独立，之后再切开关不影响已提交的。
+            size: editing.size,
+            // 提交时快照当前开关、字体与描边，新旧文字各自独立。
             bg: self.text_bg,
             bg_color: self.text_bg_color,
+            max_w: editing.max_w,
+            font_family: editing.font_family.clone(),
+            stroke_color: self.text_stroke_color,
+            stroke_width: self.width,
         };
         // 重新编辑时插回原位，否则追加到末尾。
         if let Some(idx) = editing.edit_index {
             let insert_at = idx.min(self.shapes.len());
             self.shapes.insert(insert_at, shape);
+            self.selected = Some(insert_at);
+            self.selected_many = vec![insert_at];
         } else {
             self.shapes.push(shape);
+            let idx = self.shapes.len() - 1;
+            self.selected = Some(idx);
+            self.selected_many = vec![idx];
             self.redo_stack.clear();
         }
-        // 文字已落盘为标注，后续 Esc 关窗需提示保存。
-        self.dirty = true;
         let fh = self.focus_handle.clone();
         window.focus(&fh, cx);
         cx.notify();
     }
 
-    /// 取消正在编辑的文字。
-    fn cancel_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.text_editing.is_some() {
-            self.text_editing = None;
-            let fh = self.focus_handle.clone();
-            window.focus(&fh, cx);
-            cx.notify();
-        }
-    }
-
     /// 把底图与全部标注烧录为最终图片。
     fn burn_shapes(&mut self) -> Option<RgbaImage> {
-        let base = image::open(&self.preview.path).ok()?.into_rgba8();
-        if !self.font_loaded {
+        let base = self.base_image.clone().or_else(|| {
+            image::open(&self.preview.path)
+                .ok()
+                .map(|image| Arc::new(image.to_rgba8()))
+        })?;
+        if !self.font_loaded
+            && self
+                .shapes
+                .iter()
+                .any(|shape| matches!(shape, Shape::Text { .. }))
+        {
             self.font = load_system_font();
             self.font_loaded = true;
         }
         let full = PixelRect::new(0.0, 0.0, base.width() as f32, base.height() as f32);
         Some(render_export(&base, full, &self.shapes, &self.font))
-    }
-
-    /// 开始 OCR：后台线程识别整张底图，完成后落成文字标注并复制文本。
-    ///
-    /// 推理阻塞约 0.6s，绝不能占 UI 线程；经 `background_executor` 跑，
-    /// 回来用弱引用更新（窗口已关则静默丢弃）。
-    fn run_ocr(&mut self, cx: &mut Context<Self>) {
-        // 重复点击直接提示，不叠任务。
-        if self.ocr_running {
-            let msg = tr("viewer.ocr_busy");
-            self.set_viewer_status(&msg, cx);
-            return;
-        }
-        // 模型缺失只提醒，不进任务（去哪找模型见设置页）。
-        if !ocr::models_available() {
-            self.set_viewer_status(&tr("viewer.ocr_no_models"), cx);
-            return;
-        }
-        // 底图读内存（后台线程只传像素，不碰文件与视图）。
-        let Some(base) = load_rgba(&self.preview.path) else {
-            self.set_viewer_status(&tr("viewer.export_fail"), cx);
-            return;
-        };
-        self.ocr_running = true;
-        let msg = tr("viewer.ocr_running");
-        self.set_viewer_status(&msg, cx);
-        cx.spawn(async move |weak, cx| {
-            // 推理在后台池阻塞跑，主线程只等结果。
-            let out = cx
-                .background_executor()
-                .spawn(async move { ocr::recognize_image(&base) })
-                .await;
-            // 窗口已关则丢弃，不报错。
-            let _ = weak.update(cx, |this, cx| this.finish_ocr(out, cx));
-        })
-        .detach();
-    }
-
-    /// OCR 完成：行存进面板展示，文本进剪贴板；**不自动落标注**。
-    ///
-    /// 自动 overlay 几个问题：重排字体与原图对不齐看着别扭，
-    /// 长行点进编辑框会被固定尺寸截断。改为面板里看全文，
-    /// 用户确认后再点“落为标注”（见 [`Self::apply_ocr_lines`]）。
-    fn finish_ocr(&mut self, out: anyhow::Result<Vec<ocr::OcrLine>>, cx: &mut Context<Self>) {
-        self.ocr_running = false;
-        let lines = match out {
-            Err(error) => {
-                let msg = tr_fmt("viewer.ocr_fail", &[("error", &error.to_string())]);
-                self.set_viewer_status(&msg, cx);
-                return;
-            }
-            Ok(lines) => lines,
-        };
-        // 存快照并展开提取层（空结果就不打扰了），选中清零。
-        self.ocr_lines = lines;
-        self.show_ocr_panel = !self.ocr_lines.is_empty();
-        self.selected_ocr = None;
-        if self.ocr_lines.is_empty() {
-            self.set_viewer_status(&tr("viewer.ocr_empty"), cx);
-            return;
-        }
-        // 文本同时进剪贴板，方便直接粘贴到别处；面板里还能再复制。
-        cx.write_to_clipboard(rgpui::ClipboardItem::new_string(ocr::lines_text(
-            &self.ocr_lines,
-        )));
-        let msg = tr_fmt(
-            "viewer.ocr_done",
-            &[("n", &self.ocr_lines.len().to_string())],
-        );
-        self.set_viewer_status(&msg, cx);
-    }
-
-    /// 复制面板里全部识别文本（识别完成已自动复制一次，这里供稍后手动补拷）。
-    fn copy_ocr_lines(&mut self, cx: &mut Context<Self>) {
-        if self.ocr_lines.is_empty() {
-            return;
-        }
-        cx.write_to_clipboard(rgpui::ClipboardItem::new_string(ocr::lines_text(
-            &self.ocr_lines,
-        )));
-        let msg = tr_fmt(
-            "viewer.ocr_copied",
-            &[("n", &self.ocr_lines.len().to_string())],
-        );
-        self.set_viewer_status(&msg, cx);
-    }
-
-    /// 点框 / 点行选中识别行：两侧同步高亮，文本进剪贴板，状态栏回显前 30 字确认。
-    fn select_ocr_line(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let Some(line) = self.ocr_lines.get(idx) else {
-            return;
-        };
-        self.selected_ocr = Some(idx);
-        cx.write_to_clipboard(rgpui::ClipboardItem::new_string(line.text.clone()));
-        // 状态栏只回显前 30 字，长行不撑爆。
-        let snippet: String = line.text.chars().take(30).collect();
-        let msg = tr_fmt("viewer.ocr_copy_one", &[("text", &snippet)]);
-        self.set_viewer_status(&msg, cx);
-    }
-
-    /// 把面板里的识别行落成文字标注（位置取检测框左上，字号按框宽拟合）。
-    ///
-    /// 拟合保证 overlay 上看着对齐，落成标注还是同一尺寸，所见即所得；
-    /// 无字体时回退框高（`ocr::line_text_size`）。
-    /// overlay 是近似排版（字体与原图不同，不会像素级重合），只在用户确认后执行；
-    /// 一次多条，撤销需逐条退。
-    fn apply_ocr_lines(&mut self, cx: &mut Context<Self>) {
-        if self.ocr_lines.is_empty() {
-            return;
-        }
-        // 字体懒加载（烧录同款），量字宽拟合用；失败也不阻断，最多不对齐。
-        if !self.font_loaded {
-            self.font = load_system_font();
-            self.font_loaded = true;
-        }
-        for line in &self.ocr_lines {
-            let base = line.rect.h;
-            let size = match &self.font {
-                Some(font) => ocr::fit_text_size(
-                    measure_text_width(font, &line.text, base),
-                    line.rect.w,
-                    base,
-                ),
-                None => ocr::line_text_size(base),
-            };
-            self.shapes.push(Shape::Text {
-                pos: (line.rect.x, line.rect.y),
-                content: line.text.clone(),
-                color: self.color,
-                size,
-                bg: self.text_bg,
-                bg_color: self.text_bg_color,
-            });
-        }
-        self.redo_stack.clear();
-        // 新标注已提交，后续 Esc 关窗需提示保存。
-        self.dirty = true;
-        // 落完收起提取层并清选中，标注区清爽，继续用选择工具微调。
-        self.show_ocr_panel = false;
-        self.selected_ocr = None;
-        let msg = tr_fmt(
-            "viewer.ocr_applied",
-            &[("n", &self.ocr_lines.len().to_string())],
-        );
-        self.set_viewer_status(&msg, cx);
     }
 
     /// 复制烧录图到系统剪贴板：图片与文件双格式，Word 粘贴为图片、文件夹粘贴为文件。
@@ -1518,6 +2749,7 @@ impl ImageViewer {
         // 双格式写入：一次搞定图片粘贴（Word / 画图）与文件粘贴（资源管理器）。
         match copy_image_and_file_to_clipboard(&png, &file_path) {
             Ok(()) => {
+                crate::feedback::completed();
                 let msg = tr("viewer.copy_ok");
                 self.set_viewer_status(&msg, cx);
                 main.update(cx, |state, cx| state.set_status(&msg, cx));
@@ -1526,6 +2758,7 @@ impl ImageViewer {
                 // 双格式失败时回退到纯图片复制，保证 Word 粘贴仍可用。
                 match copy_png_to_clipboard(cx, &png) {
                     Ok(()) => {
+                        crate::feedback::completed();
                         let msg = tr_fmt(
                             "viewer.copy_img_only",
                             &[("error", &file_error.to_string())],
@@ -1549,7 +2782,6 @@ impl ImageViewer {
     /// 保存烧录图到默认保存目录并记入最近文件（结果就近显示在预览底部状态栏）。
     ///
     /// # 返回
-    /// 保存成功返回 `true`；成功后清除未保存标记并收起关闭确认浮层。
     fn save_image(&mut self, cx: &mut Context<Self>) -> bool {
         let main = self.main.clone();
         // 保存永远另存为带时间戳的新文件，不覆盖原图（截图自动保存的原图同样受保护）。
@@ -1557,7 +2789,7 @@ impl ImageViewer {
         let dir = load_save_dir();
         let _ = std::fs::create_dir_all(&dir);
         let dst = dir.join(format!(
-            "rupix-{}.png",
+            "rivix-{}.png",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -1571,6 +2803,7 @@ impl ImageViewer {
                 .is_some()
         };
         if saved {
+            crate::feedback::completed();
             // 状态栏就近显示保存位置，并提供打开文件 / 打开目录快捷入口。
             let name = dst
                 .file_name()
@@ -1579,8 +2812,6 @@ impl ImageViewer {
                 .to_string();
             self.last_saved = Some(dst.clone());
             // 保存成功：脏标记清零，关闭确认浮层也不再需要。
-            self.dirty = false;
-            self.confirm_close = false;
             // 状态栏显示文件名与所在目录名（自定义目录也能一眼看出存哪了）。
             let loc = dst
                 .parent()
@@ -1607,6 +2838,7 @@ impl ImageViewer {
     fn nudge_width(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
         let width = normalize_width(self.width + delta);
         self.width = width;
+        self.apply_width_to_selected();
         // 同步滑杆 thumb，避免按钮与滑杆显示不一致。
         self.width_slider.update(cx, |state, cx| {
             state.set_value(width, window, cx);
@@ -1625,18 +2857,11 @@ impl ImageViewer {
     fn clamp_offset(&mut self) {
         let dw = self.preview.w as f32 * self.zoom;
         let dh = self.preview.h as f32 * self.zoom;
-        let (mut ox, mut oy) = self.offset;
-        ox = if dw <= self.area_w {
-            0.0
-        } else {
-            ox.clamp(-dw / 2.0, dw / 2.0)
-        };
-        oy = if dh <= self.area_h {
-            0.0
-        } else {
-            oy.clamp(-dh / 2.0, dh / 2.0)
-        };
-        self.offset = (ox, oy);
+        let (ox, oy) = self.offset;
+        // 全幅底层画布支持在窗口范围内自由中键平移（至少保留 60px 在视口内，防止彻底拖丢）。
+        let max_x = ((self.area_w + dw) / 2.0 - 60.0).max(0.0);
+        let max_y = ((self.area_h + dh) / 2.0 - 60.0).max(0.0);
+        self.offset = (ox.clamp(-max_x, max_x), oy.clamp(-max_y, max_y));
     }
 
     /// 左键按下：开始平移。
@@ -1670,6 +2895,9 @@ fn latest_text_index(shapes: &[Shape]) -> Option<usize> {
     shapes.iter().rposition(|s| matches!(s, Shape::Text { .. }))
 }
 
+/// 多个编辑窗口可同时后台关闭，序号避免同毫秒缓存文件互相覆盖。
+static NEXT_CLIPBOARD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 剪贴板缓存图片路径：保持文件存在，保证复制后资源管理器能异步读取。
 fn clipboard_png_path() -> PathBuf {
     let millis = std::time::SystemTime::now()
@@ -1677,21 +2905,573 @@ fn clipboard_png_path() -> PathBuf {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     std::env::temp_dir()
-        .join("rupix")
+        .join("rivix")
         .join("clipboard")
-        .join(format!("rupix-{millis}.png"))
+        .join(format!(
+            "rivix-{}-{millis}-{}.png",
+            std::process::id(),
+            NEXT_CLIPBOARD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+}
+
+/// 光标最后绘制，始终盖在标注之上；直接复用输入布局，不新增计时器或像素采样。
+fn paint_text_caret(input: &Entity<InputState>, window: &mut Window, cx: &rgpui::App) {
+    let state = input.read(cx);
+    if !state.is_focused(window) || !window.is_window_active() || !state.selected_range().is_empty()
+    {
+        return;
+    }
+    let cursor = state.cursor();
+    if let Some(mut bounds) = state.range_to_bounds(&(cursor..cursor)) {
+        bounds.origin += state.scroll_offset();
+        let (outer, inner) = caret_layers(bounds, window.scale_factor());
+        window.paint_quad(fill(outer, rgb(0xFFFFFF)));
+        window.paint_quad(fill(inner, rgb(0x101010)));
+    }
+}
+
+/// 双层文字光标使用输入组件的真实插入位置，不增加闪烁或采样定时器。
+fn caret_layers(line: Bounds<Pixels>, scale: f32) -> (Bounds<Pixels>, Bounds<Pixels>) {
+    let scale = scale.max(0.1);
+    let dot = 1.0 / scale;
+    let x = (line.origin.x.as_f32() * scale).round() / scale;
+    let h = (line.size.height.as_f32() * 0.85).max(dot);
+    let y = line.origin.y.as_f32() + (line.size.height.as_f32() - h) / 2.0;
+    (
+        Bounds::new(
+            point(px(x - dot), px(y - dot)),
+            size(px(dot * 3.0), px(h + dot * 2.0)),
+        ),
+        Bounds::new(point(px(x), px(y)), size(px(dot), px(h))),
+    )
+}
+
+/// 控制点顺序与命中、绘制共用。
+fn transform_handles(bounds: PixelRect) -> [(TransformHandle, (f32, f32)); 8] {
+    let (x, y, w, h) = (bounds.x, bounds.y, bounds.w, bounds.h);
+    [
+        (TransformHandle::Nw, (x, y)),
+        (TransformHandle::N, (x + w / 2.0, y)),
+        (TransformHandle::Ne, (x + w, y)),
+        (TransformHandle::E, (x + w, y + h / 2.0)),
+        (TransformHandle::Se, (x + w, y + h)),
+        (TransformHandle::S, (x + w / 2.0, y + h)),
+        (TransformHandle::Sw, (x, y + h)),
+        (TransformHandle::W, (x, y + h / 2.0)),
+    ]
+}
+
+/// 为变换控制点选择对应方向的系统光标。
+fn transform_cursor(handle: Option<TransformHandle>) -> CursorStyle {
+    // 名称以 rgpui 的实际 Windows 映射为准，避免两组对角线光标颠倒。
+    match handle {
+        Some(TransformHandle::Nw | TransformHandle::Se) => CursorStyle::ResizeUpLeftDownRight,
+        Some(TransformHandle::Ne | TransformHandle::Sw) => CursorStyle::ResizeUpRightDownLeft,
+        Some(TransformHandle::N | TransformHandle::S) => CursorStyle::ResizeUpDown,
+        Some(TransformHandle::E | TransformHandle::W) => CursorStyle::ResizeLeftRight,
+        Some(TransformHandle::Move) => CursorStyle::PointingHand,
+        Some(TransformHandle::Rotate) => CursorStyle::Crosshair,
+        None => CursorStyle::Arrow,
+    }
+}
+
+/// 优先命中八向缩放控制点与框内移动；鼠标位于四角外侧邻近区域时触发 Illustrator/Figma 式旋转。
+fn transform_hit(bounds: PixelRect, p: (f32, f32), zoom: f32) -> Option<TransformHandle> {
+    let z = zoom.max(MIN_ZOOM);
+    let hit = transform_handles(bounds)
+        .into_iter()
+        .map(|(handle, q)| (handle, (p.0 - q.0).hypot(p.1 - q.1)))
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((handle, distance)) = hit
+        && distance <= 6.0 / z
+    {
+        return Some(handle);
+    }
+    if bounds.contains(p) {
+        return Some(TransformHandle::Move);
+    }
+    let corners = [
+        (bounds.x, bounds.y),
+        (bounds.x + bounds.w, bounds.y),
+        (bounds.x + bounds.w, bounds.y + bounds.h),
+        (bounds.x, bounds.y + bounds.h),
+    ];
+    let near_corner = corners
+        .into_iter()
+        .any(|(cx, cy)| (p.0 - cx).hypot(p.1 - cy) <= 22.0 / z);
+    near_corner.then_some(TransformHandle::Rotate)
+}
+
+/// 八向缩放保持对侧锚点，最小 2 个原图像素；文字和 Shift 拖动保持比例。
+fn resize_bounds(
+    from: PixelRect,
+    delta: (f32, f32),
+    handle: TransformHandle,
+    uniform: bool,
+) -> PixelRect {
+    if handle == TransformHandle::Move || handle == TransformHandle::Rotate {
+        return PixelRect::new(from.x + delta.0, from.y + delta.1, from.w, from.h);
+    }
+    let west = matches!(
+        handle,
+        TransformHandle::W | TransformHandle::Nw | TransformHandle::Sw
+    );
+    let east = matches!(
+        handle,
+        TransformHandle::E | TransformHandle::Ne | TransformHandle::Se
+    );
+    let north = matches!(
+        handle,
+        TransformHandle::N | TransformHandle::Nw | TransformHandle::Ne
+    );
+    let south = matches!(
+        handle,
+        TransformHandle::S | TransformHandle::Sw | TransformHandle::Se
+    );
+    let left = if west {
+        (from.x + delta.0).min(from.x + from.w - 2.0)
+    } else {
+        from.x
+    };
+    let right = if east {
+        (from.x + from.w + delta.0).max(from.x + 2.0)
+    } else {
+        from.x + from.w
+    };
+    let top = if north {
+        (from.y + delta.1).min(from.y + from.h - 2.0)
+    } else {
+        from.y
+    };
+    let bottom = if south {
+        (from.y + from.h + delta.1).max(from.y + 2.0)
+    } else {
+        from.y + from.h
+    };
+    let mut out = PixelRect::new(left, top, right - left, bottom - top);
+    if uniform {
+        let sx = out.w / from.w.max(1.0);
+        let sy = out.h / from.h.max(1.0);
+        let factor = if !(north || south) {
+            sx
+        } else if !(west || east) {
+            sy
+        } else if (sx - 1.0).abs() >= (sy - 1.0).abs() {
+            sx
+        } else {
+            sy
+        };
+        out.w = from.w * factor;
+        out.h = from.h * factor;
+        out.x = if west {
+            from.x + from.w - out.w
+        } else if east {
+            from.x
+        } else {
+            from.x + (from.w - out.w) / 2.0
+        };
+        out.y = if north {
+            from.y + from.h - out.h
+        } else if south {
+            from.y
+        } else {
+            from.y + (from.h - out.h) / 2.0
+        };
+    }
+    out
+}
+
+/// 只变更矢量坐标和字号，不栅格化图片；单行文本缩放字号，段落文本仅调整框宽（混合含单行文本时统一起缩字号）。
+fn transform_shape(
+    source: &Shape,
+    from: PixelRect,
+    to: PixelRect,
+    scale_area_text_font: bool,
+) -> Shape {
+    let sx = to.w / from.w.max(1.0);
+    let sy = to.h / from.h.max(1.0);
+    let map = |p: (f32, f32)| (to.x + (p.0 - from.x) * sx, to.y + (p.1 - from.y) * sy);
+    let rect = |r: PixelRect| {
+        let p = map((r.x, r.y));
+        PixelRect::new(p.0, p.1, r.w * sx, r.h * sy)
+    };
+    let mut shape = source.clone();
+    match &mut shape {
+        Shape::Rect { rect: r, width, .. } | Shape::Ellipse { rect: r, width, .. } => {
+            *r = rect(*r);
+            *width = (*width * (sx * sy).sqrt()).clamp(0.5, 128.0);
+        }
+        Shape::Mosaic { rect: r } => *r = rect(*r),
+        Shape::Line {
+            from: a,
+            to: b,
+            width,
+            ..
+        }
+        | Shape::Arrow {
+            from: a,
+            to: b,
+            width,
+            ..
+        } => {
+            *a = map(*a);
+            *b = map(*b);
+            *width = (*width * (sx * sy).sqrt()).clamp(0.5, 128.0);
+        }
+        Shape::Pen { pts, width, .. }
+        | Shape::Highlighter { pts, width, .. }
+        | Shape::Polygon { pts, width, .. } => {
+            for p in pts {
+                *p = map(*p);
+            }
+            *width = (*width * (sx * sy).sqrt()).clamp(0.5, 128.0);
+        }
+        Shape::Text {
+            pos, size, max_w, ..
+        } => {
+            *pos = map(*pos);
+            if let Some(w) = max_w {
+                *w = (*w * sx).max(20.0);
+                if scale_area_text_font {
+                    *size = (*size * sy).clamp(4.0, 512.0);
+                }
+            } else {
+                *size = (*size * sy).clamp(4.0, 512.0);
+            }
+        }
+    }
+    shape
+}
+
+/// 蓝色细框与白色控制点只参与预览，不进入导出结果。
+fn paint_transform(
+    bounds: PixelRect,
+    zoom: f32,
+    origin: rgpui::Point<Pixels>,
+    window: &mut Window,
+) {
+    let bounds = PixelRect::new(
+        origin.x.as_f32() + bounds.x * zoom,
+        origin.y.as_f32() + bounds.y * zoom,
+        bounds.w * zoom,
+        bounds.h * zoom,
+    );
+    let blue = rgb(0x0078D4);
+    let dot = 1.0 / window.scale_factor();
+    for (x, y, w, h) in [
+        (bounds.x, bounds.y, bounds.w, dot),
+        (bounds.x, bounds.y + bounds.h, bounds.w, dot),
+        (bounds.x, bounds.y, dot, bounds.h),
+        (bounds.x + bounds.w, bounds.y, dot, bounds.h),
+    ] {
+        window.paint_quad(fill(
+            Bounds::new(point(px(x), px(y)), size(px(w), px(h))),
+            blue,
+        ));
+    }
+    for (_, p) in transform_handles(bounds) {
+        window.paint_quad(fill(
+            Bounds::new(point(px(p.0 - 4.0), px(p.1 - 4.0)), size(px(8.0), px(8.0))),
+            blue,
+        ));
+        window.paint_quad(fill(
+            Bounds::new(point(px(p.0 - 3.0), px(p.1 - 3.0)), size(px(6.0), px(6.0))),
+            rgb(0xFFFFFF),
+        ));
+    }
+}
+
+/// 绘制时按住 `Shift` 的角度 / 比例约束：直线与箭头吸附 45° 倍数，矩形/椭圆/马赛克约束正方/正圆。
+fn constrain_draw_point(
+    anchor: (f32, f32),
+    raw: (f32, f32),
+    tool: AnnoTool,
+    max_w: f32,
+    max_h: f32,
+) -> (f32, f32) {
+    let dx = raw.0 - anchor.0;
+    let dy = raw.1 - anchor.1;
+    let (nx, ny) = match tool {
+        AnnoTool::Rect | AnnoTool::Ellipse | AnnoTool::Mosaic => {
+            let side = dx.abs().max(dy.abs());
+            let sx = if dx >= 0.0 { 1.0 } else { -1.0 };
+            let sy = if dy >= 0.0 { 1.0 } else { -1.0 };
+            (anchor.0 + sx * side, anchor.1 + sy * side)
+        }
+        AnnoTool::Line | AnnoTool::Arrow | AnnoTool::Pen | AnnoTool::Highlighter => {
+            let len = dx.hypot(dy);
+            if len <= 1e-3 {
+                return raw;
+            }
+            let step = std::f32::consts::FRAC_PI_4;
+            let angle = (dy.atan2(dx) / step).round() * step;
+            (anchor.0 + len * angle.cos(), anchor.1 + len * angle.sin())
+        }
+        _ => raw,
+    };
+    (nx.clamp(0.0, max_w), ny.clamp(0.0, max_h))
+}
+
+/// 将点绕 `center` 逆时针旋转 `angle` 弧度。
+fn rotate_point(p: (f32, f32), center: (f32, f32), cos_a: f32, sin_a: f32) -> (f32, f32) {
+    let dx = p.0 - center.0;
+    let dy = p.1 - center.1;
+    (
+        center.0 + dx * cos_a - dy * sin_a,
+        center.1 + dx * sin_a + dy * cos_a,
+    )
+}
+
+/// 绕指定中心旋转单个标注；矩形与椭圆转为闭合 `Polygon` 以保留真实旋转几何。
+fn rotate_shape(shape: &Shape, center: (f32, f32), angle: f32) -> Shape {
+    if angle.abs() < 1e-4 {
+        return shape.clone();
+    }
+    let (sin_a, cos_a) = angle.sin_cos();
+    let rot = |p: (f32, f32)| rotate_point(p, center, cos_a, sin_a);
+    match shape {
+        Shape::Pen { pts, color, width } => Shape::Pen {
+            pts: pts.iter().map(|&p| rot(p)).collect(),
+            color: *color,
+            width: *width,
+        },
+        Shape::Highlighter { pts, color, width } => Shape::Highlighter {
+            pts: pts.iter().map(|&p| rot(p)).collect(),
+            color: *color,
+            width: *width,
+        },
+        Shape::Polygon {
+            pts,
+            color,
+            width,
+            fill,
+            has_stroke,
+        } => Shape::Polygon {
+            pts: pts.iter().map(|&p| rot(p)).collect(),
+            color: *color,
+            width: *width,
+            fill: *fill,
+            has_stroke: *has_stroke,
+        },
+        Shape::Line {
+            from,
+            to,
+            color,
+            width,
+        } => Shape::Line {
+            from: rot(*from),
+            to: rot(*to),
+            color: *color,
+            width: *width,
+        },
+        Shape::Arrow {
+            from,
+            to,
+            color,
+            width,
+        } => Shape::Arrow {
+            from: rot(*from),
+            to: rot(*to),
+            color: *color,
+            width: *width,
+        },
+        Shape::Rect {
+            rect,
+            color,
+            width,
+            fill,
+            has_stroke,
+            ..
+        } => {
+            let corners = [
+                (rect.x, rect.y),
+                (rect.x + rect.w, rect.y),
+                (rect.x + rect.w, rect.y + rect.h),
+                (rect.x, rect.y + rect.h),
+            ];
+            Shape::Polygon {
+                pts: corners.into_iter().map(rot).collect(),
+                color: *color,
+                width: *width,
+                fill: *fill,
+                has_stroke: *has_stroke,
+            }
+        }
+        Shape::Ellipse {
+            rect,
+            color,
+            width,
+            fill,
+            has_stroke,
+        } => {
+            let rx = rect.w / 2.0;
+            let ry = rect.h / 2.0;
+            let ecx = rect.x + rx;
+            let ecy = rect.y + ry;
+            let steps = 48usize;
+            let pts = (0..steps)
+                .map(|i| {
+                    let t = (i as f32 / steps as f32) * std::f32::consts::TAU;
+                    rot((ecx + rx * t.cos(), ecy + ry * t.sin()))
+                })
+                .collect();
+            Shape::Polygon {
+                pts,
+                color: *color,
+                width: *width,
+                fill: *fill,
+                has_stroke: *has_stroke,
+            }
+        }
+        Shape::Mosaic { rect } => {
+            let cx = rect.x + rect.w / 2.0;
+            let cy = rect.y + rect.h / 2.0;
+            let (ncx, ncy) = rot((cx, cy));
+            Shape::Mosaic {
+                rect: PixelRect::new(ncx - rect.w / 2.0, ncy - rect.h / 2.0, rect.w, rect.h),
+            }
+        }
+        Shape::Text {
+            pos,
+            content,
+            color,
+            size,
+            bg,
+            bg_color,
+            max_w,
+            font_family,
+            stroke_color,
+            stroke_width,
+        } => Shape::Text {
+            pos: rot(*pos),
+            content: content.clone(),
+            color: *color,
+            size: *size,
+            bg: *bg,
+            bg_color: *bg_color,
+            max_w: *max_w,
+            font_family: font_family.clone(),
+            stroke_color: *stroke_color,
+            stroke_width: *stroke_width,
+        },
+    }
+}
+
+/// 返回用于对齐计算的紧密外包矩形（不含线宽外扩）。
+fn shape_align_bbox(shape: &Shape) -> PixelRect {
+    match shape {
+        Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. } | Shape::Mosaic { rect } => *rect,
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            PixelRect::from_points(*from, *to)
+        }
+        Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } | Shape::Polygon { pts, .. } => {
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
+            for &(x, y) in pts {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+            if min_x <= max_x && min_y <= max_y {
+                PixelRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+            } else {
+                PixelRect::new(0.0, 0.0, 0.0, 0.0)
+            }
+        }
+        Shape::Text { .. } => shape.bbox(),
+    }
+}
+
+/// 按给定增量平移单个标注（对齐与批量移动共用）。
+fn translate_shape_by(shape: &mut Shape, dx: f32, dy: f32) {
+    match shape {
+        Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. } | Shape::Mosaic { rect } => {
+            rect.x += dx;
+            rect.y += dy;
+        }
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            from.0 += dx;
+            from.1 += dy;
+            to.0 += dx;
+            to.1 += dy;
+        }
+        Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } | Shape::Polygon { pts, .. } => {
+            for p in pts {
+                p.0 += dx;
+                p.1 += dy;
+            }
+        }
+        Shape::Text { pos, .. } => {
+            pos.0 += dx;
+            pos.1 += dy;
+        }
+    }
+}
+
+/// 后台导出完整原图加标注，缓存文件供系统图片/文件两种粘贴方式使用。
+fn annotation_png(
+    base: Option<Arc<RgbaImage>>,
+    path: &std::path::Path,
+    shapes: &[Shape],
+) -> Result<(Vec<u8>, PathBuf), String> {
+    let base = match base {
+        Some(image) => image,
+        None => Arc::new(image::open(path).map_err(|e| e.to_string())?.to_rgba8()),
+    };
+    let needs_font = shapes
+        .iter()
+        .any(|shape| matches!(shape, Shape::Text { .. }));
+    let font = if needs_font { load_system_font() } else { None };
+    if needs_font && font.is_none() {
+        return Err(tr("viewer.export_fail"));
+    }
+    let image = render_export(
+        &base,
+        PixelRect::new(0.0, 0.0, base.width() as f32, base.height() as f32),
+        shapes,
+        &font,
+    );
+    let png = png_bytes(&image).ok_or_else(|| tr("viewer.export_fail"))?;
+    let file = clipboard_png_path();
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&file, &png).map_err(|e| e.to_string())?;
+    Ok((png, file))
+}
+
+/// 仅采样截图像素，越界不改变当前绘制颜色。
+fn sample_image_color(image: &RgbaImage, p: (f32, f32)) -> Option<AnnoColor> {
+    if p.0 < 0.0 || p.1 < 0.0 || p.0 >= image.width() as f32 || p.1 >= image.height() as f32 {
+        return None;
+    }
+    let pixel = image.get_pixel(p.0.floor() as u32, p.1.floor() as u32);
+    Some(AnnoColor(pixel[0], pixel[1], pixel[2], 255))
+}
+
+/// 平移草稿并返回实际位移，供起终点同步，边缘钳制后放开空格也不跳变。
+fn translate_draft(shape: &mut Shape, delta: (f32, f32), bounds: (f32, f32)) -> (f32, f32) {
+    let before = shape.bbox();
+    move_shape_clamped(shape, delta, bounds.0, bounds.1);
+    let after = shape.bbox();
+    (after.x - before.x, after.y - before.y)
 }
 
 /// 草稿有效性：过小的图形视为误触，不提交。
 fn draft_valid(shape: &Shape) -> bool {
     match shape {
-        Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } => {
+        Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } | Shape::Polygon { pts, .. } => {
             pts.len() >= 2 && pts.first() != pts.last()
         }
         Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. } | Shape::Mosaic { rect } => {
             !rect.is_empty()
         }
-        Shape::Arrow { from, to, .. } => (to.0 - from.0).hypot(to.1 - from.1) > 2.0,
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            (to.0 - from.0).hypot(to.1 - from.1) > 2.0
+        }
         Shape::Text { .. } => true,
     }
 }
@@ -1700,7 +3480,7 @@ fn draft_valid(shape: &Shape) -> bool {
 fn move_shape(shape: &mut Shape, delta: (f32, f32)) {
     let (dx, dy) = delta;
     match shape {
-        Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } => {
+        Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } | Shape::Polygon { pts, .. } => {
             for p in pts {
                 p.0 += dx;
                 p.1 += dy;
@@ -1710,7 +3490,7 @@ fn move_shape(shape: &mut Shape, delta: (f32, f32)) {
             rect.x += dx;
             rect.y += dy;
         }
-        Shape::Arrow { from, to, .. } => {
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
             from.0 += dx;
             from.1 += dy;
             to.0 += dx;
@@ -1730,9 +3510,12 @@ fn move_shape(shape: &mut Shape, delta: (f32, f32)) {
 fn erase_hit(shapes: &[Shape], p: (f32, f32), radius: f32) -> Option<usize> {
     shapes.iter().enumerate().rev().find_map(|(i, shape)| {
         let hit = match shape {
-            Shape::Pen { pts, width, .. } | Shape::Highlighter { pts, width, .. } => {
-                stroke_distance(pts, p) <= radius + width / 2.0
-            }
+            Shape::Line {
+                from, to, width, ..
+            } => stroke_distance(&[*from, *to], p) <= radius + width / 2.0,
+            Shape::Pen { pts, width, .. }
+            | Shape::Highlighter { pts, width, .. }
+            | Shape::Polygon { pts, width, .. } => stroke_distance(pts, p) <= radius + width / 2.0,
             _ => shape.bbox().contains(p),
         };
         hit.then_some(i)
@@ -1762,9 +3545,20 @@ fn stroke_distance(pts: &[(f32, f32)], p: (f32, f32)) -> f32 {
 /// 移动标注并尽量限制在图片范围内，避免一拖就把标注完全拖出画面。
 fn move_shape_clamped(shape: &mut Shape, delta: (f32, f32), img_w: f32, img_h: f32) {
     let bbox = shape.bbox();
+    if matches!(shape, Shape::Text { .. }) || bbox.w >= img_w || bbox.h >= img_h {
+        // 文字或超大图允许边缘超出画布裁切（至少保留 24px 可见，避免超长文本锁死左右移动）。
+        let margin = 24.0;
+        let min_x = margin - bbox.w;
+        let max_x = img_w - margin;
+        let min_y = margin - bbox.h;
+        let max_y = img_h - margin;
+        let nx = (bbox.x + delta.0).clamp(min_x.min(max_x), min_x.max(max_x));
+        let ny = (bbox.y + delta.1).clamp(min_y.min(max_y), min_y.max(max_y));
+        move_shape(shape, (nx - bbox.x, ny - bbox.y));
+        return;
+    }
     let mut dx = delta.0;
     let mut dy = delta.1;
-    // 先根据当前外包矩形修正本次位移，保持标注主体留在图片范围内。
     if bbox.x + dx < 0.0 {
         dx = -bbox.x;
     }
@@ -1780,17 +3574,160 @@ fn move_shape_clamped(shape: &mut Shape, delta: (f32, f32), img_w: f32, img_h: f
     move_shape(shape, (dx, dy));
 }
 
+/// 用 `rgpui` 文本系统测量单行渲染宽度（逻辑像素）。
+fn measure_line_width(window: &Window, text: &str, font_size: f32, family: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    window
+        .text_system()
+        .shape_line(
+            text.to_string().into(),
+            px(font_size),
+            &[rgpui::TextRun {
+                len: text.len(),
+                font: rgpui::font(family.to_string()),
+                color: rgb(0xFFFFFF).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        )
+        .width
+        .as_f32()
+}
+
+/// 按 `max_w` 宽度将文本自动折行为多行（编辑态与提交态共用，确保所见即所得）。
+fn wrap_lines_in_ui(
+    window: &Window,
+    content: &str,
+    font_size: f32,
+    family: &str,
+    max_w: f32,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for para in content.split('\n') {
+        let mut cur = String::new();
+        for ch in para.chars() {
+            let mut next = cur.clone();
+            next.push(ch);
+            if !cur.is_empty() && measure_line_width(window, &next, font_size, family) > max_w {
+                lines.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+        }
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// 矢量标注转 canvas 绘制路径。
 ///
 /// `paint_path` 使用窗口坐标，不会自动叠加 canvas 自身的布局偏移。
 /// 因此必须使用 rgpui 在绘制回调里传入的 `bounds.origin` 作为图片容器真实左上角，
 /// 避免手写工具栏高度或图片区居中偏移时漏算。
-fn shape_path(
-    shape: &Shape,
+/// 向 `PathBuilder` 追加（可选圆角的）矩形闭合路径，供填充与描边共用。
+fn append_rect_path(
+    builder: &mut PathBuilder,
+    rect: &PixelRect,
+    radius: f32,
     zoom: f32,
     origin_x: f32,
     origin_y: f32,
-) -> Option<(Path<Pixels>, Rgba)> {
+) {
+    let pt = |x: f32, y: f32| point(px(origin_x + x * zoom), px(origin_y + y * zoom));
+    let r = radius.max(0.0).min(rect.w * 0.5).min(rect.h * 0.5);
+    if r <= 0.5 {
+        builder.move_to(pt(rect.x, rect.y));
+        builder.line_to(pt(rect.x + rect.w, rect.y));
+        builder.line_to(pt(rect.x + rect.w, rect.y + rect.h));
+        builder.line_to(pt(rect.x, rect.y + rect.h));
+        builder.close();
+        return;
+    }
+    let k = 0.552_284_8 * r;
+    let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+    builder.move_to(pt(x + r, y));
+    builder.line_to(pt(x + w - r, y));
+    builder.cubic_bezier_to(pt(x + w, y + r), pt(x + w - r + k, y), pt(x + w, y + r - k));
+    builder.line_to(pt(x + w, y + h - r));
+    builder.cubic_bezier_to(
+        pt(x + w - r, y + h),
+        pt(x + w, y + h - r + k),
+        pt(x + w - r + k, y + h),
+    );
+    builder.line_to(pt(x + r, y + h));
+    builder.cubic_bezier_to(pt(x, y + h - r), pt(x + r - k, y + h), pt(x, y + h - r + k));
+    builder.line_to(pt(x, y + r));
+    builder.cubic_bezier_to(pt(x + r, y), pt(x, y + r - k), pt(x + r - k, y));
+    builder.close();
+}
+
+/// 生成图形填充路径（矩形 / 椭圆 / 多边形支持填充，需在描边之前绘制）。
+fn shape_fill_path(shape: &Shape, zoom: f32, origin_x: f32, origin_y: f32) -> Option<(Path, Rgba)> {
+    let pt = |x: f32, y: f32| point(px(origin_x + x * zoom), px(origin_y + y * zoom));
+    match shape {
+        Shape::Rect {
+            rect,
+            fill: Some(fill_color),
+            radius,
+            ..
+        } => {
+            let mut builder = PathBuilder::fill();
+            append_rect_path(&mut builder, rect, *radius, zoom, origin_x, origin_y);
+            Some((builder.build().ok()?, fill_color.to_rgpui()))
+        }
+        Shape::Ellipse {
+            rect,
+            fill: Some(fill_color),
+            ..
+        } => {
+            let (cx, cy) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+            let (rx, ry) = (rect.w / 2.0, rect.h / 2.0);
+            if rx <= 0.0 || ry <= 0.0 {
+                return None;
+            }
+            let mut builder = PathBuilder::fill();
+            for i in 0..48 {
+                let t = i as f32 / 48.0 * std::f32::consts::TAU;
+                let p = pt(cx + rx * t.cos(), cy + ry * t.sin());
+                if i == 0 {
+                    builder.move_to(p);
+                } else {
+                    builder.line_to(p);
+                }
+            }
+            builder.close();
+            Some((builder.build().ok()?, fill_color.to_rgpui()))
+        }
+        Shape::Polygon {
+            pts,
+            fill: Some(fill_color),
+            ..
+        } => {
+            if pts.len() < 3 {
+                return None;
+            }
+            let mut builder = PathBuilder::fill();
+            for (i, (x, y)) in pts.iter().enumerate() {
+                if i == 0 {
+                    builder.move_to(pt(*x, *y));
+                } else {
+                    builder.line_to(pt(*x, *y));
+                }
+            }
+            builder.close();
+            Some((builder.build().ok()?, fill_color.to_rgpui()))
+        }
+        _ => None,
+    }
+}
+
+fn shape_path(shape: &Shape, zoom: f32, origin_x: f32, origin_y: f32) -> Option<(Path, Rgba)> {
     let pt = |x: f32, y: f32| point(px(origin_x + x * zoom), px(origin_y + y * zoom));
     let stroker = |width: f32| PathBuilder::stroke(px((width * zoom).max(1.0)));
     match shape {
@@ -1813,16 +3750,52 @@ fn shape_path(
             }
             Some((path, c))
         }
-        Shape::Rect { rect, color, width } => {
+        Shape::Polygon {
+            pts,
+            color,
+            width,
+            has_stroke,
+            ..
+        } => {
+            if !*has_stroke || pts.len() < 2 {
+                return None;
+            }
             let mut builder = stroker(*width);
-            builder.move_to(pt(rect.x, rect.y));
-            builder.line_to(pt(rect.x + rect.w, rect.y));
-            builder.line_to(pt(rect.x + rect.w, rect.y + rect.h));
-            builder.line_to(pt(rect.x, rect.y + rect.h));
+            for (i, (x, y)) in pts.iter().enumerate() {
+                if i == 0 {
+                    builder.move_to(pt(*x, *y));
+                } else {
+                    builder.line_to(pt(*x, *y));
+                }
+            }
             builder.close();
             Some((builder.build().ok()?, color.to_rgpui()))
         }
-        Shape::Ellipse { rect, color, width } => {
+        Shape::Rect {
+            rect,
+            color,
+            width,
+            has_stroke,
+            radius,
+            ..
+        } => {
+            if !*has_stroke {
+                return None;
+            }
+            let mut builder = stroker(*width);
+            append_rect_path(&mut builder, rect, *radius, zoom, origin_x, origin_y);
+            Some((builder.build().ok()?, color.to_rgpui()))
+        }
+        Shape::Ellipse {
+            rect,
+            color,
+            width,
+            has_stroke,
+            ..
+        } => {
+            if !*has_stroke {
+                return None;
+            }
             let (cx, cy) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
             let (rx, ry) = (rect.w / 2.0, rect.h / 2.0);
             if rx <= 0.0 || ry <= 0.0 {
@@ -1838,6 +3811,17 @@ fn shape_path(
                     builder.line_to(p);
                 }
             }
+            Some((builder.build().ok()?, color.to_rgpui()))
+        }
+        Shape::Line {
+            from,
+            to,
+            color,
+            width,
+        } => {
+            let mut builder = stroker(*width);
+            builder.move_to(pt(from.0, from.1));
+            builder.line_to(pt(to.0, to.1));
             Some((builder.build().ok()?, color.to_rgpui()))
         }
         Shape::Arrow {
@@ -1871,28 +3855,8 @@ fn shape_path(
             builder.line_to(pt(w2.0, w2.1));
             Some((builder.build().ok()?, color.to_rgpui()))
         }
-        // 马赛克：画半透明矩形 + 十字网格预览。
-        Shape::Mosaic { rect } => {
-            let (rx, ry) = (rect.w * zoom, rect.h * zoom);
-            if rx <= 0.0 || ry <= 0.0 {
-                return None;
-            }
-            let mut builder = PathBuilder::stroke(px(1.0));
-            // 半透明外框。
-            builder.move_to(pt(rect.x, rect.y));
-            builder.line_to(pt(rect.x + rect.w, rect.y));
-            builder.line_to(pt(rect.x + rect.w, rect.y + rect.h));
-            builder.line_to(pt(rect.x, rect.y + rect.h));
-            builder.close();
-            let path = builder.build().ok()?;
-            let color = Rgba {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.35,
-            };
-            Some((path, color))
-        }
+        // 马赛克：像素块本身已可见，不额外绘制边框描边。
+        Shape::Mosaic { .. } => None,
         // 文字走 div 层，画布跳过。
         Shape::Text { .. } => None,
     }
@@ -1948,63 +3912,223 @@ fn paint_mosaic_preview(
 }
 
 impl Render for ImageViewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        self.area_w = viewport.width.as_f32().max(1.0);
+        self.area_h = viewport.height.as_f32().max(1.0);
+        self.fit_zoom = (self.area_w / self.preview.w as f32)
+            .min(self.area_h / self.preview.h as f32)
+            .clamp(MIN_ZOOM, 1.0);
+        let transform_box = if !self.transform_originals.is_empty() {
+            self.transform_group_bounds(window)
+        } else {
+            None
+        };
         let (w, h) = (self.preview.w, self.preview.h);
         let dw = (w as f32 * self.zoom).round().max(1.0);
         let dh = (h as f32 * self.zoom).round().max(1.0);
         let percent = format!("{}%", (self.zoom * 100.0).round() as u32);
+        let vt = ViewerTheme::current();
 
         div()
+            .relative()
             .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x1E1E1E))
-            .text_color(rgb(0xDDDDDD))
+            .overflow_hidden()
+            .bg(vt.canvas_bg)
+            .text_color(vt.text_primary)
             .track_focus(&self.focus_handle)
+            // 根视图监听鼠标移动/抬起，确保在右侧 SV/色相条拖拽滑出边界时仍跟手。
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                if this.sv_dragging {
+                    let sv_b = this.sv_bounds.lock().ok().and_then(|g| *g);
+                    if let Some(b) = sv_b {
+                        let w = b.size.width.as_f32().max(1.0);
+                        let h = b.size.height.as_f32().max(1.0);
+                        this.picker_sat =
+                            ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w).clamp(0.0, 1.0);
+                        this.picker_val = (1.0
+                            - (ev.position.y.as_f32() - b.origin.y.as_f32()) / h)
+                            .clamp(0.0, 1.0);
+                        this.apply_picker_hsv(cx);
+                    }
+                } else if this.hue_dragging {
+                    let hue_b = this.hue_bounds.lock().ok().and_then(|g| *g);
+                    if let Some(b) = hue_b {
+                        let w = b.size.width.as_f32().max(1.0);
+                        let t =
+                            ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w).clamp(0.0, 1.0);
+                        this.picker_hue = t * 360.0;
+                        this.apply_picker_hsv(cx);
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, _window, _cx| {
+                    this.sv_dragging = false;
+                    this.hue_dragging = false;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, _window, _cx| {
+                    this.sv_dragging = false;
+                    this.hue_dragging = false;
+                }),
+            )
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if this.text_editing.is_some() {
+                if this.closing {
+                    return;
+                }
+                let modi = &ev.keystroke.modifiers;
+                if modi.control && ev.keystroke.key.as_str() == "t" {
+                    this.begin_transform(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if !this.transform_originals.is_empty() {
                     match ev.keystroke.key.as_str() {
-                        "enter" => {
-                            this.commit_text(window, cx);
+                        "escape" => {
+                            this.end_transform(true);
+                            cx.notify();
                             return;
                         }
-                        "escape" => {
-                            this.cancel_text(window, cx);
+                        "enter" => {
+                            this.end_transform(false);
+                            cx.notify();
                             return;
                         }
                         _ => {}
                     }
                 }
-                let modi = &ev.keystroke.modifiers;
-                match ev.keystroke.key.as_str() {
-                    // Esc 优先级：关闭确认（二次 Esc 取消）> 拾色器面板 > 脏检查关窗。
-                    "escape" => {
-                        if this.confirm_close {
-                            // 确认浮层已展开：二次 Esc 视为取消，留在窗口继续编辑。
-                            this.confirm_close = false;
-                            cx.notify();
-                        } else if this.show_ocr_panel {
-                            // 先收 OCR 面板，识别行保留，再点识别会被新结果替换。
-                            this.show_ocr_panel = false;
-                            cx.notify();
-                        } else if this.show_color_picker {
-                            // 优先收起拾色器面板，避免想关面板却退出整个窗口。
-                            this.show_color_picker = false;
-                            cx.notify();
-                        } else if this.has_unsaved_changes() {
-                            // 有未保存标注：先弹确认浮层，不直接关窗丢数据。
-                            // 未提交的草稿本就不会进保存结果，这里直接丢弃。
-                            this.draft = None;
-                            this.anchor = None;
-                            this.confirm_close = true;
-                            cx.notify();
-                        } else {
-                            window.remove_window();
-                        }
+                if modi.control && ev.keystroke.key.as_str() == "s" {
+                    this.handle(ViewerAction::Save, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if modi.control
+                    && ev.keystroke.key.as_str() == "v"
+                    && this.text_editing.is_none()
+                    && let Some(clip_path) = crate::export::read_image_from_clipboard(true)
+                    && let Some(preview) = preview_from_path(&clip_path)
+                {
+                    open_viewer(this.main.clone(), cx, preview);
+                    cx.stop_propagation();
+                    return;
+                }
+                if this
+                    .text_size_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+                {
+                    if matches!(ev.keystroke.key.as_str(), "enter" | "escape") {
+                        let fh = this.focus_handle.clone();
+                        window.focus(&fh, cx);
+                        cx.stop_propagation();
                     }
-                    // 确认浮层中回车 = 保存并关闭（与按钮一致）。
-                    "enter" if this.confirm_close => {
-                        this.save_and_close(window, cx);
+                    return;
+                }
+                if let Some(editing) = &this.text_editing {
+                    let is_area = editing.max_w.is_some();
+                    match ev.keystroke.key.as_str() {
+                        // 单次 Esc 提交文字并直接切回选择工具；单行回车或段落 Ctrl+Enter 仅提交文字。
+                        "escape" => {
+                            this.commit_text(window, cx);
+                            this.tool = AnnoTool::Select;
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                        "enter" if !is_area || modi.control => {
+                            this.commit_text(window, cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                // Ctrl+A：全选所有已标注元素（非文本编辑状态下生效）。
+                if modi.control
+                    && !modi.shift
+                    && !modi.alt
+                    && !modi.platform
+                    && ev.keystroke.key.eq_ignore_ascii_case("a")
+                {
+                    this.select_all_shapes(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // Delete / Backspace 删除选中的元素。
+                if matches!(ev.keystroke.key.as_str(), "delete" | "backspace") {
+                    let mut indices = this.selected_indices();
+                    if !indices.is_empty() {
+                        indices.sort_unstable_by(|a, b| b.cmp(a));
+                        for idx in indices {
+                            if idx < this.shapes.len() {
+                                this.shapes.remove(idx);
+                            }
+                        }
+                        this.end_transform(false);
+                        this.clear_selection();
+                        this.redo_stack.clear();
+                        this.set_viewer_status("已删除选中元素", cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                // Shift+X：互换填充与描边（矩形 / 椭圆 / 多边形）。
+                if modi.shift
+                    && !modi.control
+                    && !modi.alt
+                    && ev.keystroke.key.eq_ignore_ascii_case("x")
+                {
+                    this.handle(ViewerAction::SwapFillStroke, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // 多选对齐快捷键：VIA 功能键（F14-F18 / Pause）与 Alt+W/A/S/D/H/V。
+                let key_l = ev.keystroke.key.as_str();
+                let align_hit = match key_l {
+                    "f14" => Some(AlignMode::Top),
+                    "f15" => Some(AlignMode::Left),
+                    "f16" => Some(AlignMode::Bottom),
+                    "f17" => Some(AlignMode::Right),
+                    "f18" => Some(AlignMode::CenterH),
+                    "pause" => Some(AlignMode::CenterV),
+                    "w" if modi.alt && !modi.control => Some(AlignMode::Top),
+                    "a" if modi.alt && !modi.control => Some(AlignMode::Left),
+                    "s" if modi.alt && !modi.control => Some(AlignMode::Bottom),
+                    "d" if modi.alt && !modi.control => Some(AlignMode::Right),
+                    "h" if modi.alt && !modi.control => Some(AlignMode::CenterH),
+                    "v" if modi.alt && !modi.control => Some(AlignMode::CenterV),
+                    _ => None,
+                };
+                if let Some(mode) = align_hit {
+                    this.handle(ViewerAction::Align(mode), window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if !modi.control
+                    && !modi.alt
+                    && !modi.platform
+                    && let Some(tool) = AnnoTool::from_shortcut(ev.keystroke.key.as_str())
+                {
+                    this.handle(ViewerAction::Tool(tool), window, cx);
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "escape" => {
+                        if this.tool != AnnoTool::Select {
+                            this.handle(ViewerAction::Tool(AnnoTool::Select), window, cx);
+                        } else if this.marquee.is_some()
+                            || this.selected.is_some()
+                            || !this.selected_many.is_empty()
+                        {
+                            this.marquee = None;
+                            this.clear_selection();
+                            cx.notify();
+                        }
                     }
                     "+" | "=" => this.zoom_by(ZOOM_STEP, cx),
                     "-" | "_" => this.zoom_by(1.0 / ZOOM_STEP, cx),
@@ -2017,14 +4141,6 @@ impl Render for ImageViewer {
                         if !this.space_held {
                             this.space_held = true;
                             cx.notify();
-                        }
-                    }
-                    // V / 1-8 切工具（文字输入中不拦截，避免打字跳工具）。
-                    "v" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8"
-                        if this.text_editing.is_none() =>
-                    {
-                        if let Some(tool) = AnnoTool::from_shortcut(ev.keystroke.key.as_str()) {
-                            this.handle(ViewerAction::Tool(tool), window, cx);
                         }
                     }
                     "z" if modi.control && !modi.shift => {
@@ -2047,256 +4163,43 @@ impl Render for ImageViewer {
                     cx.notify();
                 }
             }))
-            // 操作排：查看缩放 + 撤销重做 + 线宽底色 + 文件操作（关闭走系统标题栏 / Esc）。
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(ROW_H))
-                    .px_3()
-                    .bg(rgb(0x2D2D2D))
-                    .child(self.bar_button(cx, "−", ViewerAction::ZoomOut))
-                    .child(div().text_sm().w(px(48.)).child(percent))
-                    .child(self.bar_button(cx, "+", ViewerAction::ZoomIn))
-                    .child(self.bar_button(cx, tr("viewer.fit"), ViewerAction::Fit))
-                    .child(self.mini_button(
-                        cx,
-                        "undo",
-                        tr("viewer.undo"),
-                        ViewerAction::Undo,
-                        false,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "redo",
-                        tr("viewer.redo"),
-                        ViewerAction::Redo,
-                        false,
-                    ))
-                    // 线宽：− / + 步进 + 滑杆自由调节 + 当前值显示。
-                    .child(self.mini_button(
-                        cx,
-                        "w-down",
-                        "−",
-                        ViewerAction::WidthNudge(-1.0),
-                        false,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xBBBBBB))
-                                    .child(tr("viewer.line_width")),
-                            )
-                            .child(div().w(px(110.)).child(Slider::new(&self.width_slider)))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .w(px(38.))
-                                    .text_color(rgb(0xCCCCCC))
-                                    .child(format!("{}px", self.width.round() as u32)),
-                            ),
-                    )
-                    .child(self.mini_button(cx, "w-up", "+", ViewerAction::WidthNudge(1.0), false))
-                    .child(self.mini_button(
-                        cx,
-                        "text-bg",
-                        tr("viewer.text_bg"),
-                        ViewerAction::TextBg,
-                        self.text_bg,
-                    ))
-                    // 底色块：显示当前底色（半透明预览），点击用取色器设置底色。
-                    .child(self.bg_swatch(cx))
-                    .child(self.bar_button(cx, tr("viewer.copy"), ViewerAction::Copy))
-                    .child(self.bar_button(cx, tr("viewer.save"), ViewerAction::Save))
-                    .child(self.bar_button(cx, tr("viewer.ocr"), ViewerAction::Ocr))
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_xs()
-                            .text_right()
-                            .text_color(rgb(0x999999))
-                            .child(tr("viewer.op_hint")),
-                    ),
-            )
-            // 标注排：标注工具 + 预设颜色（精简，自定义色走取色器）+ 提示。
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(ROW_H))
-                    .px_3()
-                    .bg(rgb(0x2D2D2D))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-select",
-                        tr("tool.select"),
-                        ViewerAction::Tool(AnnoTool::Select),
-                        self.tool == AnnoTool::Select,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-rect",
-                        tr("tool.rect"),
-                        ViewerAction::Tool(AnnoTool::Rect),
-                        self.tool == AnnoTool::Rect,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-ellipse",
-                        tr("tool.ellipse"),
-                        ViewerAction::Tool(AnnoTool::Ellipse),
-                        self.tool == AnnoTool::Ellipse,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-arrow",
-                        tr("tool.arrow"),
-                        ViewerAction::Tool(AnnoTool::Arrow),
-                        self.tool == AnnoTool::Arrow,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-pen",
-                        tr("tool.pen"),
-                        ViewerAction::Tool(AnnoTool::Pen),
-                        self.tool == AnnoTool::Pen,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-highlighter",
-                        tr("tool.highlighter"),
-                        ViewerAction::Tool(AnnoTool::Highlighter),
-                        self.tool == AnnoTool::Highlighter,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-eraser",
-                        tr("tool.eraser"),
-                        ViewerAction::Tool(AnnoTool::Eraser),
-                        self.tool == AnnoTool::Eraser,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-mosaic",
-                        tr("tool.mosaic"),
-                        ViewerAction::Tool(AnnoTool::Mosaic),
-                        self.tool == AnnoTool::Mosaic,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "tool-text",
-                        tr("tool.text"),
-                        ViewerAction::Tool(AnnoTool::Text),
-                        self.tool == AnnoTool::Text,
-                    ))
-                    // 预设颜色精简为 6 色，其余自定义色走取色器。
-                    .child(self.color_swatch(cx, AnnoColor::RED))
-                    .child(self.color_swatch(cx, AnnoColor::YELLOW))
-                    .child(self.color_swatch(cx, AnnoColor::GREEN))
-                    .child(self.color_swatch(cx, AnnoColor::BLUE))
-                    .child(self.color_swatch(cx, AnnoColor::WHITE))
-                    .child(self.color_swatch(cx, AnnoColor::BLACK))
-                    .child(self.mini_button(
-                        cx,
-                        "color-picker",
-                        tr("tool.picker"),
-                        ViewerAction::ToggleColorPicker,
-                        self.show_color_picker,
-                    ))
-                    // 当前色指示：色块 + hex，自定义色一眼可见（纯文字看不出颜色）。
-                    .child({
-                        let current = self.color.to_rgpui();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .w(px(14.))
-                                    .h(px(14.))
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(0x666666))
-                                    .bg(current),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xCCCCCC))
-                                    .child(self.color.to_hex()),
-                            )
-                    })
-                    // 线宽与文字底色在操作排，避免标注排过宽。
-                    .child(
-                        if self.tool == AnnoTool::Text && self.text_editing.is_some() {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x999999))
-                                .child(tr("viewer.text_confirm"))
-                        } else if self.tool == AnnoTool::Text {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x999999))
-                                .child(tr("viewer.text_new"))
-                        } else if self.tool == AnnoTool::Select {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x999999))
-                                .child(tr("viewer.select_hint"))
-                        } else if self.tool == AnnoTool::Eraser {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x999999))
-                                .child(tr("viewer.eraser_hint"))
-                        } else if self.tool == AnnoTool::Highlighter {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x999999))
-                                .child(tr("viewer.marker_hint"))
-                        } else {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x999999))
-                                .child(tr("viewer.place_hint"))
-                        },
-                    ),
-            )
-            // 图片区。
+            // 底层全幅画布区（放大后可自然延伸至左右面板与顶部胶囊下层）。
             .child({
                 let left = (self.area_w - dw) / 2.0 + self.offset.0;
                 let top = (self.area_h - dh) / 2.0 + self.offset.1;
                 let zoom = self.zoom;
-                let area = div().flex_1().relative().overflow_hidden();
-                // 平移中一律抓手；空格按住时预告可平移；OCR 模式下箭头（框上有单独手形）；
+                let area = div().absolute().inset_0().overflow_hidden();
+                // Windows 后端的抓手会退化成箭头，移动统一借用系统手形；
                 // 其余按工具显示。
                 let area = if self.pan_last.is_some() {
-                    area.cursor(CursorStyle::ClosedHand)
+                    area.cursor(CursorStyle::PointingHand)
+                } else if !self.transform_originals.is_empty() {
+                    area.cursor(transform_cursor(
+                        self.transform_drag
+                            .as_ref()
+                            .map(|drag| drag.handle)
+                            .or(self.transform_hover),
+                    ))
                 } else if self.space_held {
-                    area.cursor(CursorStyle::OpenHand)
-                } else if self.show_ocr_panel {
-                    area.cursor(CursorStyle::Arrow)
+                    area.cursor(CursorStyle::PointingHand)
                 } else {
                     match self.tool {
                         AnnoTool::Select => {
-                            if self.drag_text.is_some() || self.drag_shape.is_some() {
-                                area.cursor(CursorStyle::ClosedHand)
-                            } else if self.hover_shape || self.can_pan() {
-                                area.cursor(CursorStyle::OpenHand)
+                            if self.drag_text.is_some()
+                                || self.drag_shape.is_some()
+                                || self.hover_shape
+                                || self.can_pan()
+                            {
+                                area.cursor(CursorStyle::PointingHand)
                             } else {
                                 area.cursor(CursorStyle::Arrow)
                             }
                         }
                         AnnoTool::Text => area.cursor(CursorStyle::IBeam),
-                        AnnoTool::Eraser => area.cursor(CursorStyle::PointingHand),
+                        AnnoTool::Eyedropper => area.cursor(CursorStyle::Crosshair),
+                        AnnoTool::Eraser => area.cursor(CursorStyle::OperationNotAllowed),
                         AnnoTool::Rect
+                        | AnnoTool::Line
                         | AnnoTool::Ellipse
                         | AnnoTool::Arrow
                         | AnnoTool::Pen
@@ -2318,19 +4221,19 @@ impl Render for ImageViewer {
                             this.on_pan_down(ev, cx);
                         }),
                     )
-                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
-                        this.on_anno_move(ev, cx);
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                        this.on_anno_move(ev, window, cx);
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
-                            this.on_anno_up(cx);
+                        cx.listener(|this, _ev, window, cx| {
+                            this.on_anno_up(Some(window), cx);
                         }),
                     )
                     .on_mouse_up_out(
                         MouseButton::Left,
-                        cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
-                            this.on_anno_up(cx);
+                        cx.listener(|this, _ev, window, cx| {
+                            this.on_anno_up(Some(window), cx);
                         }),
                     )
                     .on_mouse_up(
@@ -2346,7 +4249,7 @@ impl Render for ImageViewer {
                         }),
                     )
                     .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _window, cx| {
-                        if !ev.modifiers.control {
+                        if this.draft.is_some() || this.transform_drag.is_some() {
                             return;
                         }
                         let dy = match ev.delta {
@@ -2359,7 +4262,7 @@ impl Render for ImageViewer {
                             this.zoom_by(1.0 / ZOOM_STEP, cx);
                         }
                     }));
-                // 图片容器组装完后，OCR 提取层按需盖在最上（照片式原位文字）。
+                // 图片与标注放进同一个坐标容器，不裁切容器边界以支持将元素移出画布并继续操作（导出时再按底图裁切）。
                 let container = div()
                     .absolute()
                     .left(px(left))
@@ -2380,66 +4283,159 @@ impl Render for ImageViewer {
                                 size,
                                 bg,
                                 bg_color,
+                                max_w,
+                                font_family,
+                                stroke_color,
+                                stroke_width,
                             } = shape
                             {
                                 let sz = size * zoom;
+                                let family: &str =
+                                    font_family.as_deref().unwrap_or(TEXT_FONT_FAMILY);
+                                let lh = (sz * TEXT_LINE_HEIGHT).ceil().max(1.0);
+                                let build_text_node = |text_col: Rgba| {
+                                    let mut node = div()
+                                        .text_color(text_col)
+                                        .font_family(family.to_string())
+                                        .font_weight(rgpui::FontWeight::NORMAL)
+                                        .text_size(px(sz))
+                                        .line_height(px(lh));
+                                    if let Some(box_w) = max_w {
+                                        let lines = wrap_lines_in_ui(
+                                            window,
+                                            content,
+                                            sz,
+                                            family,
+                                            box_w * zoom,
+                                        );
+                                        node = node.w(px(box_w * zoom)).flex().flex_col().children(
+                                            lines.into_iter().map(|line| {
+                                                div().h(px(lh)).whitespace_nowrap().child(line)
+                                            }),
+                                        );
+                                    } else {
+                                        node = node.whitespace_nowrap().child(content.clone());
+                                    }
+                                    node
+                                };
                                 let mut d = div()
                                     .absolute()
                                     .left(px(pos.0 * zoom))
-                                    .top(px(pos.1 * zoom))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_color(color.to_rgpui())
-                                    .text_size(px(sz))
-                                    .child(content.clone());
-                                // 按条底色：用该条自己的底色，透明度统一。
-                                if *bg {
-                                    d = d.bg(bg_color.as_text_bg_rgpui());
+                                    .top(px(pos.1 * zoom));
+                                if let Some(sc) = stroke_color
+                                    && *stroke_width > 0.1
+                                {
+                                    let r = (stroke_width * zoom).max(0.8);
+                                    let sc_rgpui = sc.to_rgpui();
+                                    let mut wrapper = div().relative();
+                                    // 12 方向圆形偏移描边，置于文字填充后方模拟圆角描边。
+                                    for k in 0..12 {
+                                        let ang = k as f32 / 12.0 * std::f32::consts::TAU;
+                                        let ox = r * ang.cos();
+                                        let oy = r * ang.sin();
+                                        wrapper = wrapper.child(
+                                            build_text_node(sc_rgpui)
+                                                .absolute()
+                                                .left(px(ox))
+                                                .top(px(oy)),
+                                        );
+                                    }
+                                    d = d.child(wrapper.child(build_text_node(color.to_rgpui())));
+                                } else {
+                                    d = d.child(build_text_node(color.to_rgpui()));
                                 }
+                                // 按条底色：用该条自己的底色，透明度统一。
+                                let d = if *bg {
+                                    d.bg(bg_color.as_text_bg_rgpui())
+                                } else {
+                                    d
+                                };
                                 marks.push(d);
                             }
                         }
-                        // 正在编辑的 inline 输入框（所见即所得：底色跟随当前开关与底色）。
+                        // 正在编辑的 inline 输入框（段落文本显示清晰框体并实时多行自动换行，单行文本保持自由横向延伸）。
                         if let Some(editing) = &self.text_editing {
-                            let input_text_size = DEFAULT_TEXT_SIZE * zoom;
-                            let input_border = self.color.to_rgpui();
-                            let edit_bg = self.text_bg;
-                            let edit_color = self.color;
-                            let edit_bg_color = self.text_bg_color;
-                            let mut editor = div()
-                                .absolute()
-                                .left(px(editing.container_pos.0))
-                                .top(px(editing.container_pos.1))
-                                .min_w(px(180.0))
-                                .max_w(px(400.0))
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(input_border)
-                                .text_color(edit_color.to_rgpui())
-                                .text_size(px(input_text_size));
-                            if edit_bg {
-                                editor = editor.bg(edit_bg_color.as_text_bg_rgpui());
-                            }
-                            marks.push(
-                                editor
-                                    // 阻止输入框点击冒泡到图片区，避免触发 commit + place。
+                            let input_text_size = editing.size * zoom;
+                            let line_height = (input_text_size * TEXT_LINE_HEIGHT).ceil().max(1.0);
+                            let edit_family: String = editing
+                                .font_family
+                                .clone()
+                                .unwrap_or_else(|| TEXT_FONT_FAMILY.to_string());
+                            let value = editing.input.read(cx).text().to_string();
+                            let mut input = Input::new(&editing.input)
+                                .appearance(false)
+                                .bordered(false)
+                                .focus_bordered(false)
+                                .p_0()
+                                .font_family(edit_family.clone())
+                                .font_weight(rgpui::FontWeight::NORMAL)
+                                .text_color(self.color.to_rgpui())
+                                .text_size(px(input_text_size))
+                                .line_height(px(line_height));
+
+                            if let Some(mw) = editing.max_w {
+                                let box_w_px = (mw * zoom).max(input_text_size * 2.0);
+                                let area_box = div()
+                                    .absolute()
+                                    .left(px(editing.img_pos.0 * zoom))
+                                    .top(px(editing.img_pos.1 * zoom))
+                                    .w(px(box_w_px))
+                                    .min_h(px(line_height))
+                                    .border_1()
+                                    .border_color(rgba(0x0A84FFE0))
+                                    .bg(if self.text_bg && !value.is_empty() {
+                                        self.text_bg_color.as_text_bg_rgpui()
+                                    } else {
+                                        rgba(0x0A84FF14)
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|_, _ev, _, cx| {
+                                        cx.listener(|this, _ev, window, cx| {
+                                            if let Some(editing) = &this.text_editing {
+                                                editing.input.update(cx, |state, cx| {
+                                                    state.focus(window, cx)
+                                                });
+                                            }
                                             cx.stop_propagation();
                                         }),
                                     )
-                                    .child(
-                                        Input::new(&editing.input)
-                                            .appearance(false)
-                                            .bordered(false)
-                                            .text_color(edit_color.to_rgpui())
-                                            .text_size(px(input_text_size)),
-                                    ),
-                            );
+                                    .child(input);
+                                marks.push(area_box);
+                            } else {
+                                input.style().size.height = Some(px(line_height).into());
+                                let measured = measure_line_width(
+                                    window,
+                                    &value,
+                                    input_text_size,
+                                    &edit_family,
+                                );
+                                let box_width =
+                                    (measured + input_text_size + 4.0).max(input_text_size * 2.0);
+                                let mut editor = div()
+                                    .absolute()
+                                    .left(px(editing.img_pos.0 * zoom))
+                                    .top(px(editing.img_pos.1 * zoom))
+                                    .w(px(box_width))
+                                    .h(px(line_height))
+                                    .text_color(self.color.to_rgpui())
+                                    .text_size(px(input_text_size))
+                                    .line_height(px(line_height));
+                                // 默认只显示原位文字和光标；用户主动打开文字底色时才预览实际底色。
+                                if self.text_bg && !value.is_empty() {
+                                    editor = editor.bg(self.text_bg_color.as_text_bg_rgpui());
+                                }
+                                marks.push(
+                                    editor
+                                        // 阻止输入框点击冒泡到图片区，避免触发 commit + place。
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _ev, _, cx| {
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(input),
+                                );
+                            }
                         }
                         marks
                     })
@@ -2447,10 +4443,34 @@ impl Render for ImageViewer {
                     .child({
                         let paint_shapes = self.shapes.clone();
                         let paint_draft = self.draft.clone();
+                        let caret_input = self
+                            .text_editing
+                            .as_ref()
+                            .map(|editing| editing.input.clone());
                         let base_image = self.base_image.clone();
+                        let paint_marquee = self.marquee;
+                        let paint_text_box = self.text_box_draft;
+                        let selected_bboxes: Vec<PixelRect> = if transform_box.is_none() {
+                            self.selected_indices()
+                                .into_iter()
+                                .filter_map(|i| {
+                                    let s = self.shapes.get(i)?;
+                                    // 马赛克画完后不留多余边框；仅在选择工具下高亮方便拖动。
+                                    if matches!(s, Shape::Mosaic { .. })
+                                        && self.tool != AnnoTool::Select
+                                    {
+                                        None
+                                    } else {
+                                        Some(self.shape_ui_bbox(s, window))
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         canvas(
                             move |bounds, _, _| bounds,
-                            move |_bounds, paint_bounds, window, _| {
+                            move |_bounds, paint_bounds, window, cx| {
                                 let origin = paint_bounds.origin;
                                 for shape in paint_shapes.iter().chain(paint_draft.iter()) {
                                     if let Shape::Mosaic { rect } = shape
@@ -2465,6 +4485,14 @@ impl Render for ImageViewer {
                                             origin.y.as_f32(),
                                         );
                                     }
+                                    if let Some((fill_path, fill_col)) = shape_fill_path(
+                                        shape,
+                                        zoom,
+                                        origin.x.as_f32(),
+                                        origin.y.as_f32(),
+                                    ) {
+                                        window.paint_path(fill_path, fill_col);
+                                    }
                                     if let Some((path, color)) = shape_path(
                                         shape,
                                         zoom,
@@ -2473,6 +4501,52 @@ impl Render for ImageViewer {
                                     ) {
                                         window.paint_path(path, color);
                                     }
+                                }
+                                // 选中态细线指示框（提示当前可直接用右侧属性栏批量调整）。
+                                for b in &selected_bboxes {
+                                    let pad = 4.0;
+                                    let sx = origin.x.as_f32() + b.x * zoom - pad;
+                                    let sy = origin.y.as_f32() + b.y * zoom - pad;
+                                    let sw = (b.w * zoom + pad * 2.0).max(8.0);
+                                    let sh = (b.h * zoom + pad * 2.0).max(8.0);
+                                    let mut pb = PathBuilder::stroke(px(1.2));
+                                    pb.move_to(point(px(sx), px(sy)));
+                                    pb.line_to(point(px(sx + sw), px(sy)));
+                                    pb.line_to(point(px(sx + sw), px(sy + sh)));
+                                    pb.line_to(point(px(sx), px(sy + sh)));
+                                    pb.line_to(point(px(sx), px(sy)));
+                                    if let Ok(path) = pb.build() {
+                                        window.paint_path(path, rgba(0x0A84FFD8));
+                                    }
+                                }
+                                // Illustrator 风格左键框选或文本框拉框预览矩形。
+                                for box_pts in paint_marquee.into_iter().chain(paint_text_box) {
+                                    let (sx, sy, ex, ey) = box_pts;
+                                    let r = PixelRect::from_points((sx, sy), (ex, ey));
+                                    let rx = origin.x.as_f32() + r.x * zoom;
+                                    let ry = origin.y.as_f32() + r.y * zoom;
+                                    let rw = (r.w * zoom).max(1.0);
+                                    let rh = (r.h * zoom).max(1.0);
+                                    let box_bounds = Bounds {
+                                        origin: point(px(rx), px(ry)),
+                                        size: size(px(rw), px(rh)),
+                                    };
+                                    window.paint_quad(fill(box_bounds, rgba(0x0A84FF28)));
+                                    let mut pb = PathBuilder::stroke(px(1.2));
+                                    pb.move_to(point(px(rx), px(ry)));
+                                    pb.line_to(point(px(rx + rw), px(ry)));
+                                    pb.line_to(point(px(rx + rw), px(ry + rh)));
+                                    pb.line_to(point(px(rx), px(ry + rh)));
+                                    pb.line_to(point(px(rx), px(ry)));
+                                    if let Ok(path) = pb.build() {
+                                        window.paint_path(path, rgba(0x0A84FFE0));
+                                    }
+                                }
+                                if let Some(bounds) = transform_box {
+                                    paint_transform(bounds, zoom, origin, window);
+                                }
+                                if let Some(input) = &caret_input {
+                                    paint_text_caret(input, window, cx);
                                 }
                             },
                         )
@@ -2483,419 +4557,1716 @@ impl Render for ImageViewer {
                         .w(px(dw))
                         .h(px(dh))
                     });
-                let container = if self.show_ocr_panel {
-                    container.child(self.ocr_overlay(cx, zoom))
-                } else {
-                    container
-                };
-                let area = area.child(container);
-                let area = if self.show_color_picker {
-                    area.child(
-                        div()
-                            .absolute()
-                            .left(px(12.0))
-                            .top(px(12.0))
-                            .occlude()
-                            // 颜色面板浮在图片上，事件到这里为止，避免拖滑块时触发标注绘制。
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
-                            )
-                            .on_mouse_move(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
-                            .on_scroll_wheel(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
-                            // 标题标明当前目标：字色还是底色，避免调错。
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .text_xs()
-                                    .text_color(rgb(0xCCCCCC))
-                                    .child(tr(if self.picker_for_bg {
-                                        "viewer.picker_bg"
-                                    } else {
-                                        "viewer.picker_fg"
-                                    })),
-                            )
-                            .child(self.color_picker.clone()),
-                    )
-                } else {
-                    area
-                };
-                // OCR 右侧面板：默认列出全部文字，确认浮层之下（确认优先模态）。
-                let area = if self.show_ocr_panel {
-                    area.child(self.ocr_side_panel(cx))
-                } else {
-                    area
-                };
-                // 关闭确认浮层：有未保存修改时 Esc 弹出，模态盖住图片区防误触。
-                if self.confirm_close {
-                    area.child(self.close_confirm(cx))
-                } else {
-                    area
-                }
+                area.child(container)
             })
-            // 底部状态栏：复制 / 保存结果就近显示 + 图片信息。
-            .child(self.status_bar(cx))
+            // 顶部双胶囊栏（融合式拖拽 + 撤销重做 + 保存 / 复制完成 + 窗口控制）。
+            .child(self.render_top_capsules(window, cx))
+            // 左侧自适应高度工具箱（贴左居中，带图标 + 中文名称 + 快捷键）。
+            .child(self.render_left_dock(cx))
+            // 右侧自适应高度属性检查器（贴右居中，含圆角 SV 取色区 + 下方色相条）。
+            .child(self.render_right_inspector(cx, &percent))
+            // 左下角 3 秒渐隐状态提示胶囊。
+            .children(self.render_bottom_status())
+    }
+}
+
+/// 标注编辑器专属半透明视觉色板（跟随深/浅色模式）。
+struct ViewerTheme {
+    canvas_bg: Rgba,
+    panel_bg: Rgba,
+    card_bg: Rgba,
+    hover_bg: Rgba,
+    panel_border: Rgba,
+    inner_border: Rgba,
+    active_pill_bg: Rgba,
+    active_pill_text: Rgba,
+    accent: Rgba,
+    text_primary: Rgba,
+    text_secondary: Rgba,
+    text_muted: Rgba,
+}
+
+impl ViewerTheme {
+    /// 根据全局深浅色配置返回当前标注界面配色。
+    fn current() -> Self {
+        if crate::app::is_dark_mode() {
+            Self {
+                canvas_bg: rgb(0x0F1014),
+                panel_bg: rgba(0x1C1C20D8),
+                card_bg: rgba(0xFFFFFF10),
+                hover_bg: rgba(0xFFFFFF1A),
+                panel_border: rgba(0xFFFFFF24),
+                inner_border: rgba(0xFFFFFF14),
+                active_pill_bg: rgb(0xF5F5F7),
+                active_pill_text: rgb(0x111216),
+                accent: rgb(0xFF2D55),
+                text_primary: rgb(0xF5F5F7),
+                text_secondary: rgba(0xF5F5F7B0),
+                text_muted: rgba(0xF5F5F76E),
+            }
+        } else {
+            Self {
+                canvas_bg: rgb(0xE6E9EF),
+                panel_bg: rgba(0xFFFFFFDC),
+                card_bg: rgba(0x0000000B),
+                hover_bg: rgba(0x00000014),
+                panel_border: rgba(0x0000001A),
+                inner_border: rgba(0x00000010),
+                active_pill_bg: rgb(0x1C1C1E),
+                active_pill_text: rgb(0xFFFFFF),
+                accent: rgb(0xFF2D55),
+                text_primary: rgb(0x1C1C1E),
+                text_secondary: rgba(0x1C1C1EB0),
+                text_muted: rgba(0x1C1C1E6E),
+            }
+        }
+    }
+}
+
+/// HSV（`h`: 0..360, `s`: 0..1, `v`: 0..1）转 `AnnoColor`。
+fn hsv_to_anno(h: f32, s: f32, v: f32) -> AnnoColor {
+    let h = h.rem_euclid(360.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    AnnoColor(
+        ((r + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        255,
+    )
+}
+
+/// `AnnoColor` 反算 HSV（`h`: 0..360, `s`: 0..1, `v`: 0..1）。
+fn rgb_to_hsv(color: AnnoColor) -> (f32, f32, f32) {
+    let r = color.0 as f32 / 255.0;
+    let g = color.1 as f32 / 255.0;
+    let b = color.2 as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let h = if delta <= 1e-5 {
+        0.0
+    } else if (max - r).abs() < 1e-5 {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if (max - g).abs() < 1e-5 {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let s = if max <= 1e-5 { 0.0 } else { delta / max };
+    (h, s, max)
+}
+
+/// 在给定 16×16 区域内绘制标注工具线性矢量图标。
+fn paint_tool_icon(tool: AnnoTool, bounds: Bounds<Pixels>, color: Rgba, window: &mut Window) {
+    let ox = bounds.origin.x.as_f32();
+    let oy = bounds.origin.y.as_f32();
+    let w = bounds.size.width.as_f32();
+    let h = bounds.size.height.as_f32();
+    let pt = |nx: f32, ny: f32| point(px(ox + nx * w), px(oy + ny * h));
+
+    let mut b = PathBuilder::stroke(px(1.5));
+    match tool {
+        AnnoTool::Select => {
+            b.move_to(pt(0.22, 0.16));
+            b.line_to(pt(0.22, 0.80));
+            b.line_to(pt(0.42, 0.62));
+            b.line_to(pt(0.60, 0.88));
+            b.line_to(pt(0.70, 0.82));
+            b.line_to(pt(0.52, 0.56));
+            b.line_to(pt(0.78, 0.56));
+            b.line_to(pt(0.22, 0.16));
+        }
+        AnnoTool::Rect => {
+            b.move_to(pt(0.18, 0.22));
+            b.line_to(pt(0.82, 0.22));
+            b.line_to(pt(0.82, 0.78));
+            b.line_to(pt(0.18, 0.78));
+            b.line_to(pt(0.18, 0.22));
+        }
+        AnnoTool::Ellipse => {
+            let steps = 20;
+            for i in 0..=steps {
+                let a = (i as f32 / steps as f32) * std::f32::consts::TAU;
+                let p = pt(0.5 + 0.34 * a.cos(), 0.5 + 0.26 * a.sin());
+                if i == 0 {
+                    b.move_to(p);
+                } else {
+                    b.line_to(p);
+                }
+            }
+        }
+        AnnoTool::Line => {
+            b.move_to(pt(0.20, 0.80));
+            b.line_to(pt(0.80, 0.20));
+        }
+        AnnoTool::Arrow => {
+            b.move_to(pt(0.20, 0.80));
+            b.line_to(pt(0.80, 0.20));
+            b.move_to(pt(0.44, 0.20));
+            b.line_to(pt(0.80, 0.20));
+            b.line_to(pt(0.80, 0.56));
+        }
+        AnnoTool::Pen => {
+            b.move_to(pt(0.22, 0.78));
+            b.line_to(pt(0.32, 0.54));
+            b.line_to(pt(0.70, 0.16));
+            b.line_to(pt(0.84, 0.30));
+            b.line_to(pt(0.46, 0.68));
+            b.line_to(pt(0.22, 0.78));
+        }
+        AnnoTool::Highlighter => {
+            b.move_to(pt(0.18, 0.76));
+            b.line_to(pt(0.52, 0.76));
+            b.move_to(pt(0.28, 0.64));
+            b.line_to(pt(0.66, 0.22));
+            b.line_to(pt(0.82, 0.38));
+            b.line_to(pt(0.44, 0.72));
+        }
+        AnnoTool::Mosaic => {
+            // 2×2 网格代表马赛克。
+            b.move_to(pt(0.20, 0.20));
+            b.line_to(pt(0.80, 0.20));
+            b.line_to(pt(0.80, 0.80));
+            b.line_to(pt(0.20, 0.80));
+            b.line_to(pt(0.20, 0.20));
+            b.move_to(pt(0.50, 0.20));
+            b.line_to(pt(0.50, 0.80));
+            b.move_to(pt(0.20, 0.50));
+            b.line_to(pt(0.80, 0.50));
+        }
+        AnnoTool::Text => {
+            b.move_to(pt(0.22, 0.22));
+            b.line_to(pt(0.78, 0.22));
+            b.move_to(pt(0.50, 0.22));
+            b.line_to(pt(0.50, 0.80));
+            b.move_to(pt(0.36, 0.80));
+            b.line_to(pt(0.64, 0.80));
+        }
+        AnnoTool::Eyedropper => {
+            b.move_to(pt(0.20, 0.80));
+            b.line_to(pt(0.34, 0.66));
+            b.line_to(pt(0.68, 0.32));
+            b.move_to(pt(0.56, 0.20));
+            b.line_to(pt(0.80, 0.44));
+        }
+        AnnoTool::Eraser => {
+            b.move_to(pt(0.22, 0.62));
+            b.line_to(pt(0.56, 0.22));
+            b.line_to(pt(0.82, 0.48));
+            b.line_to(pt(0.48, 0.82));
+            b.line_to(pt(0.22, 0.62));
+            b.move_to(pt(0.44, 0.82));
+            b.line_to(pt(0.84, 0.82));
+        }
+    }
+    if let Ok(path) = b.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// 左侧工具箱中显示的工具名称（中文简洁名称 + 快捷键提示）。
+fn tool_label_and_key(tool: AnnoTool) -> (&'static str, &'static str) {
+    match tool {
+        AnnoTool::Select => ("选择", "V"),
+        AnnoTool::Rect => ("矩形", "R"),
+        AnnoTool::Ellipse => ("椭圆", "O"),
+        AnnoTool::Line => ("直线", "L"),
+        AnnoTool::Arrow => ("箭头", "3"),
+        AnnoTool::Pen => ("画笔", "B"),
+        AnnoTool::Highlighter => ("荧光笔", "5"),
+        AnnoTool::Mosaic => ("马赛克", "M"),
+        AnnoTool::Text => ("文字", "T"),
+        AnnoTool::Eyedropper => ("吸管", "I"),
+        AnnoTool::Eraser => ("橡皮擦", "E"),
     }
 }
 
 impl ImageViewer {
-    /// OCR 提取层（编号矩形框）：只画框，不重排文字。
-    ///
-    /// 之前 overlay 重排文字的教训：检测框偏大 / 并行时，拟合字撑爆行间没法看。
-    /// 只画框则对齐天然精确（框即检测结果），文字一律走右侧面板看；
-    /// 点框 / 点行双向选中高亮，复制走状态栏与剪贴板。
-    /// 框层吞掉左键按下 / 弹起 / 移动（OCR 模式下图片区不落笔，见 `on_anno_down` 守卫），
-    /// 滚轮放行（Ctrl+滚轮照常缩放）。
-    fn ocr_overlay(&self, cx: &mut Context<Self>, zoom: f32) -> impl IntoElement {
-        let selected = self.selected_ocr;
+    /// 顶部双悬浮胶囊栏（左：拖拽/品牌/尺寸/撤销重做；右：主题/保存/复制完成/窗口控制）。
+    fn render_top_capsules(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let vt = ViewerTheme::current();
+        let view = cx.entity();
+        let dark = crate::app::is_dark_mode();
+        let maximized = crate::window::is_maximized(window);
+
         div()
+            .id("viewer-top-title-strip")
             .absolute()
-            .left(px(0.0))
             .top(px(0.0))
+            .left(px(0.0))
             .right(px(0.0))
-            .bottom(px(0.0))
-            .occlude()
-            // 只截停左键按下 / 弹起（OCR 模式下图片区不落笔）；
-            // 移动事件放行，中键 / 空格平移照常可用。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _ev, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|_, _ev, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .children(
-                self.ocr_lines
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| {
-                        // 每框一个点击闭包，实体按框克隆（`Entity` 是廉价句柄）。
-                        let view = cx.entity();
-                        let is_selected = selected == Some(i);
+            .h(px(54.0))
+            .px(px(12.0))
+            .pt(px(12.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            // 顶部整条透明标题栏空白处（含左右胶囊之间）均可拖动窗口与双击最大化。
+            .on_mouse_down(MouseButton::Left, |event, window, cx| {
+                cx.stop_propagation();
+                if event.click_count == 2 {
+                    crate::window::toggle_maximize(window);
+                } else {
+                    window.start_window_move();
+                }
+            })
+            // 左侧胶囊：拖拽区（品牌 + 尺寸）+ 撤销/重做 + 当前状态（按钮区不触发 start_window_move）
+            .child(
+                div()
+                    .id("viewer-top-left-pill")
+                    .occlude()
+                    .h(px(40.0))
+                    .px_3()
+                    .rounded_full()
+                    .bg(vt.panel_bg)
+                    .border_1()
+                    .border_color(vt.panel_border)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
+                    )
+                    .on_scroll_wheel(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
+                    .child(
                         div()
-                            .absolute()
-                            .id(format!("ocr-box-{i}"))
-                            .left(px(line.rect.x * zoom))
-                            .top(px(line.rect.y * zoom))
-                            .w(px(line.rect.w * zoom))
-                            .h(px(line.rect.h * zoom))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .border_2()
-                            .border_color(if is_selected {
-                                rgb(0xFFFFFF)
-                            } else {
-                                rgb(0x66B2FF)
-                            })
-                            .bg(if is_selected {
-                                Rgba {
-                                    r: 0.3,
-                                    g: 0.6,
-                                    b: 1.0,
-                                    a: 0.18,
-                                }
-                            } else {
-                                Rgba {
-                                    r: 0.0,
-                                    g: 0.0,
-                                    b: 0.0,
-                                    a: 0.0,
+                            .id("viewer-top-drag-zone")
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .on_mouse_down(MouseButton::Left, |event, window, cx| {
+                                cx.stop_propagation();
+                                if event.click_count == 2 {
+                                    crate::window::toggle_maximize(window);
+                                } else {
+                                    window.start_window_move();
                                 }
                             })
-                            // 角标：框内左上角，点框时一眼对应面板行号。
+                            .child(img(viewer_logo()).w(px(22.0)).h(px(22.0)))
                             .child(
                                 div()
-                                    .absolute()
-                                    .left(px(0.0))
-                                    .top(px(0.0))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x66B2FF))
-                                    .text_color(rgb(0xFFFFFF))
-                                    .text_size(px(11.))
-                                    .child(format!("{}", i + 1)),
+                                    .text_sm()
+                                    .text_color(vt.text_primary)
+                                    .child(tr("viewer.editor_title")),
                             )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _ev, _, cx| {
-                                    cx.stop_propagation();
-                                }),
-                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(vt.text_muted)
+                                    .child(format!("{} × {}", self.preview.w, self.preview.h)),
+                            ),
+                    )
+                    .child(div().w(px(1.0)).h(px(14.0)).bg(vt.inner_border))
+                    .child(self.capsule_btn(cx, "undo", tr("viewer.undo"), ViewerAction::Undo))
+                    .child(self.capsule_btn(cx, "redo", tr("viewer.redo"), ViewerAction::Redo)),
+            )
+            // 右侧胶囊：深浅主题切换 + 保存 + 复制完成 + 窗口控制
+            .child(
+                div()
+                    .id("viewer-top-right-pill")
+                    .occlude()
+                    .h(px(40.0))
+                    .px_3()
+                    .rounded_full()
+                    .bg(vt.panel_bg)
+                    .border_1()
+                    .border_color(vt.panel_border)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
+                    )
+                    .on_scroll_wheel(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
+                    .child(self.capsule_btn(
+                        cx,
+                        "theme",
+                        if dark { "浅色" } else { "深色" },
+                        ViewerAction::ToggleTheme,
+                    ))
+                    .child(div().w(px(1.0)).h(px(14.0)).bg(vt.inner_border))
+                    .child(self.capsule_btn(cx, "save", tr("viewer.save"), ViewerAction::Save))
+                    .child(self.capsule_btn(cx, "copy", tr("viewer.copy"), ViewerAction::Copy))
+                    .child({
+                        let view_p = view.clone();
+                        div()
+                            .id("viewer-pin-finish")
+                            .h(px(28.0))
+                            .px_3()
+                            .rounded_full()
+                            .bg(vt.active_pill_bg)
+                            .text_color(vt.active_pill_text)
+                            .text_xs()
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .child("钉图")
                             .on_click(move |_, window, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.handle(ViewerAction::OcrSelectLine(i), window, cx)
+                                view_p.update(cx, |this, cx| {
+                                    this.handle(ViewerAction::Pin, window, cx)
                                 });
                             })
                     })
-                    .collect::<Vec<_>>(),
-            )
-    }
-
-    /// OCR 右侧面板：默认列出全部识别文字，点行与图上框双向选中高亮。
-    ///
-    /// 行可滚（多行截图防撑爆）；面板吞掉鼠标与滚轮，避免误触图片区。
-    fn ocr_side_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
-        let selected = self.selected_ocr;
-        let title = tr_fmt(
-            "viewer.ocr_panel_title",
-            &[("n", &self.ocr_lines.len().to_string())],
-        );
-        div()
-            .absolute()
-            .right(px(12.0))
-            .top(px(12.0))
-            .w(px(300.0))
-            .max_h(px(420.0))
-            .flex()
-            .flex_col()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x555555))
-            .bg(rgb(0x252525))
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _ev, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|_, _ev, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_move(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
-            .on_scroll_wheel(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_sm()
-                    .text_color(rgb(0xFFFFFF))
-                    .child(title),
-            )
-            .child(
-                div().id("ocr-rows").flex_1().overflow_y_scroll().children(
-                    self.ocr_lines
-                        .iter()
-                        .enumerate()
-                        .map(|(i, line)| {
-                            // 行也要可点：id 让它可交互，与图上框共用选中动作。
-                            let view = view.clone();
-                            let is_selected = selected == Some(i);
-                            div()
-                                .id(format!("ocr-row-{i}"))
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .bg(if is_selected {
-                                    rgb(0x1E90FF)
-                                } else {
-                                    rgb(0x252525)
-                                })
-                                .text_xs()
-                                .text_color(rgb(0xDDDDDD))
-                                .hover(|style| {
-                                    style.bg(if is_selected {
-                                        rgb(0x1E90FF)
-                                    } else {
-                                        rgb(0x3A3A3A)
+                    .child(div().w(px(1.0)).h(px(14.0)).bg(vt.inner_border))
+                    .children(
+                        [(0, "─"), (1, if maximized { "❐" } else { "□" }), (2, "✕")]
+                            .into_iter()
+                            .map(|(id, lbl)| {
+                                div()
+                                    .id(format!("viewer-win-{id}"))
+                                    .w(px(24.0))
+                                    .h(px(24.0))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_xs()
+                                    .text_color(vt.text_secondary)
+                                    .cursor_pointer()
+                                    .hover(move |s| {
+                                        s.bg(if id == 2 {
+                                            rgba(0xFF3B30D8)
+                                        } else {
+                                            vt.hover_bg
+                                        })
                                     })
-                                })
-                                .child(format!("{:>2}. {}", i + 1, line.text))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _ev, _, cx| {
-                                        cx.stop_propagation();
-                                    }),
-                                )
-                                .on_click(move |_, window, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.handle(ViewerAction::OcrSelectLine(i), window, cx)
-                                    });
-                                })
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .child(self.mini_button(
-                        cx,
-                        "ocr-copy-all",
-                        tr("viewer.ocr_copy_all"),
-                        ViewerAction::OcrCopyAll,
-                        false,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "ocr-apply",
-                        tr("viewer.ocr_apply"),
-                        ViewerAction::OcrApply,
-                        true,
-                    ))
-                    .child(self.mini_button(
-                        cx,
-                        "ocr-close",
-                        "×",
-                        ViewerAction::CloseOcrPanel,
-                        false,
-                    )),
-            )
-    }
-
-    /// 关闭确认浮层：有未保存标注时 Esc 弹出，居中模态三选一。
-    ///
-    /// 浮层盖住图片区并吞掉鼠标 / 滚轮事件，避免误触继续标注；
-    /// 点击遮罩不关闭（防误触丢数据），只走保存并关闭 / 直接关闭 / 取消。
-    fn close_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .absolute()
-            .left(px(0.0))
-            .top(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(Rgba {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.55,
-            })
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _ev, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|_, _ev, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_move(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
-            .on_scroll_wheel(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x555555))
-                    .bg(rgb(0x2D2D2D))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xFFFFFF))
-                            .child(tr("confirm.title")),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(self.mini_button(
-                                cx,
-                                "confirm-save-close",
-                                tr("confirm.save"),
-                                ViewerAction::ConfirmSaveClose,
-                                true,
-                            ))
-                            .child(self.mini_button(
-                                cx,
-                                "confirm-discard-close",
-                                tr("confirm.discard"),
-                                ViewerAction::ConfirmDiscardClose,
-                                false,
-                            ))
-                            .child(self.mini_button(
-                                cx,
-                                "confirm-cancel-close",
-                                tr("confirm.cancel"),
-                                ViewerAction::CancelCloseConfirm,
-                                false,
-                            )),
+                                    .child(lbl)
+                                    .on_click(cx.listener(move |this, _, window, cx| match id {
+                                        0 => window.minimize_window(),
+                                        1 => crate::window::toggle_maximize(window),
+                                        _ => this.handle(ViewerAction::Close, window, cx),
+                                    }))
+                            }),
                     ),
             )
     }
 
-    /// 底部状态栏（复制 / 保存反馈 + 图片信息 + 已保存快捷入口）。
-    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // 右侧图片信息：尺寸 / 缩放 / 标注数，一目了然；有未保存修改时追加提醒。
-        let mut info = tr_fmt(
-            "viewer.info",
-            &[
-                ("w", &self.preview.w.to_string()),
-                ("h", &self.preview.h.to_string()),
-                ("zoom", &((self.zoom * 100.0).round() as u32).to_string()),
-                ("n", &self.shapes.len().to_string()),
-            ],
-        );
-        if self.dirty {
-            info.push_str(&tr("viewer.unsaved"));
-        }
-        let mut row = div()
+    /// 顶部胶囊通用按钮。
+    fn capsule_btn(
+        &self,
+        cx: &mut Context<Self>,
+        id: &str,
+        label: impl Into<String>,
+        action: ViewerAction,
+    ) -> impl IntoElement {
+        let vt = ViewerTheme::current();
+        let view = cx.entity();
+        div()
+            .id(format!("viewer-cap-{id}"))
+            .h(px(28.0))
+            .px_2()
+            .rounded_full()
             .flex()
             .items_center()
-            .gap_2()
-            .h(px(STATUS_H))
-            .px_3()
-            .bg(rgb(0x252525))
+            .text_xs()
+            .text_color(vt.text_secondary)
+            .cursor_pointer()
+            .hover(move |s| s.bg(vt.hover_bg))
+            .child(label.into())
+            .on_click(move |_, window, cx| {
+                let act = action.clone();
+                view.update(cx, |this, cx| this.handle(act, window, cx));
+            })
+    }
+
+    /// 左侧自适应高度工具箱（贴左居中，带图标 + 中文文本 + 快捷键，可折叠）。
+    fn render_left_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let vt = ViewerTheme::current();
+        let view = cx.entity();
+        let compact = self.dock_compact;
+
+        let groups: &[&[AnnoTool]] = &[
+            &[AnnoTool::Select],
+            &[
+                AnnoTool::Rect,
+                AnnoTool::Ellipse,
+                AnnoTool::Line,
+                AnnoTool::Arrow,
+            ],
+            &[AnnoTool::Pen, AnnoTool::Highlighter, AnnoTool::Mosaic],
+            &[AnnoTool::Text, AnnoTool::Eyedropper, AnnoTool::Eraser],
+        ];
+
+        let mut panel = div()
+            .id("viewer-left-dock")
+            .occlude()
+            .w(px(if compact { 54.0 } else { 154.0 }))
+            .p_2()
+            .rounded(px(18.0))
+            .bg(vt.panel_bg)
+            .border_1()
+            .border_color(vt.panel_border)
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_move(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
+            .on_scroll_wheel(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
             .child(
                 div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .text_xs()
-                    .text_color(rgb(0xBBBBBB))
-                    .child(self.status.to_string()),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_1()
+                    .pb_1()
+                    .children(
+                        (!compact).then(|| div().text_xs().text_color(vt.text_muted).child("工具")),
+                    )
+                    .child({
+                        let view_t = view.clone();
+                        div()
+                            .id("viewer-dock-toggle")
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .rounded_full()
+                            .bg(vt.card_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(vt.text_secondary)
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(vt.hover_bg))
+                            .child(if compact { "›" } else { "‹" })
+                            .on_click(move |_, window, cx| {
+                                view_t.update(cx, |this, cx| {
+                                    this.handle(ViewerAction::ToggleDock, window, cx);
+                                });
+                            })
+                    }),
             );
-        // 保存成功后才出现快捷入口：打开文件 / 打开目录。
-        if self.last_saved.is_some() {
-            row = row
-                .child(self.mini_button(
-                    cx,
-                    "open-saved-file",
-                    tr("viewer.open_file"),
-                    ViewerAction::OpenSavedFile,
-                    false,
-                ))
-                .child(self.mini_button(
-                    cx,
-                    "open-saved-dir",
-                    tr("viewer.open_dir"),
-                    ViewerAction::OpenSavedDir,
-                    false,
-                ));
+
+        for (gi, group) in groups.iter().enumerate() {
+            if gi > 0 {
+                panel = panel.child(div().h(px(1.0)).mx_1().my_1().bg(vt.inner_border));
+            }
+            for &tool in *group {
+                let active = self.tool == tool
+                    && !(tool == AnnoTool::Select && !self.transform_originals.is_empty());
+                let (name, key) = tool_label_and_key(tool);
+                let icon_color = if active {
+                    vt.active_pill_text
+                } else {
+                    vt.text_secondary
+                };
+                let view_tool = view.clone();
+                let mut row = div()
+                    .id(format!("viewer-dock-{key}"))
+                    .h(px(32.0))
+                    .rounded(px(11.0))
+                    .flex()
+                    .items_center()
+                    .when(compact, |d| d.px_0().justify_center())
+                    .when(!compact, |d| d.px_2().justify_between())
+                    .cursor_pointer()
+                    .bg(if active {
+                        vt.active_pill_bg
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .hover(move |s| if active { s } else { s.bg(vt.card_bg) })
+                    .on_click(move |_, window, cx| {
+                        view_tool.update(cx, |this, cx| {
+                            this.handle(ViewerAction::Tool(tool), window, cx);
+                        });
+                    });
+
+                let mut left = div().flex().items_center().gap_2().child(
+                    canvas(
+                        move |bounds, _, _| bounds,
+                        move |_bounds, paint_bounds, window, _| {
+                            paint_tool_icon(tool, paint_bounds, icon_color, window);
+                        },
+                    )
+                    .w(px(16.0))
+                    .h(px(16.0)),
+                );
+                if !compact {
+                    left = left.child(
+                        div()
+                            .text_xs()
+                            .text_color(if active {
+                                vt.active_pill_text
+                            } else {
+                                vt.text_primary
+                            })
+                            .child(name),
+                    );
+                }
+                row = row.child(left);
+                if !compact {
+                    row = row.child(
+                        div()
+                            .text_xs()
+                            .text_color(if active {
+                                vt.active_pill_text
+                            } else {
+                                vt.text_muted
+                            })
+                            .child(key),
+                    );
+                }
+                panel = panel.child(row);
+
+                // 在「选择」工具正下方显式提供「变换」入口（对应 Ctrl+T 自由缩放变形）。
+                if tool == AnnoTool::Select {
+                    let tr_active = !self.transform_originals.is_empty();
+                    let tr_icon_color = if tr_active {
+                        vt.active_pill_text
+                    } else {
+                        vt.text_secondary
+                    };
+                    let view_tr = view.clone();
+                    let mut tr_row = div()
+                        .id("viewer-dock-transform")
+                        .h(px(32.0))
+                        .rounded(px(11.0))
+                        .flex()
+                        .items_center()
+                        .when(compact, |d| d.px_0().justify_center())
+                        .when(!compact, |d| d.px_2().justify_between())
+                        .cursor_pointer()
+                        .bg(if tr_active {
+                            vt.active_pill_bg
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .hover(move |s| if tr_active { s } else { s.bg(vt.card_bg) })
+                        .on_click(move |_, window, cx| {
+                            view_tr.update(cx, |this, cx| {
+                                this.handle(ViewerAction::Transform, window, cx);
+                            });
+                        });
+                    let mut tr_left = div().flex().items_center().gap_2().child(
+                        canvas(
+                            move |bounds, _, _| bounds,
+                            move |_bounds, paint_bounds, window, _| {
+                                let ox = paint_bounds.origin.x.as_f32();
+                                let oy = paint_bounds.origin.y.as_f32();
+                                let w = paint_bounds.size.width.as_f32();
+                                let h = paint_bounds.size.height.as_f32();
+                                let pt = |nx: f32, ny: f32| point(px(ox + nx * w), px(oy + ny * h));
+                                let mut b = PathBuilder::stroke(px(1.4));
+                                // 外框 + 四角控制点小框示意自由变换
+                                b.move_to(pt(0.24, 0.24));
+                                b.line_to(pt(0.76, 0.24));
+                                b.line_to(pt(0.76, 0.76));
+                                b.line_to(pt(0.24, 0.76));
+                                b.line_to(pt(0.24, 0.24));
+                                for (cx_n, cy_n) in
+                                    [(0.20, 0.20), (0.80, 0.20), (0.80, 0.80), (0.20, 0.80)]
+                                {
+                                    b.move_to(pt(cx_n - 0.06, cy_n - 0.06));
+                                    b.line_to(pt(cx_n + 0.06, cy_n - 0.06));
+                                    b.line_to(pt(cx_n + 0.06, cy_n + 0.06));
+                                    b.line_to(pt(cx_n - 0.06, cy_n + 0.06));
+                                    b.line_to(pt(cx_n - 0.06, cy_n - 0.06));
+                                }
+                                if let Ok(path) = b.build() {
+                                    window.paint_path(path, tr_icon_color);
+                                }
+                            },
+                        )
+                        .w(px(16.0))
+                        .h(px(16.0)),
+                    );
+                    if !compact {
+                        tr_left = tr_left.child(
+                            div()
+                                .text_xs()
+                                .text_color(if tr_active {
+                                    vt.active_pill_text
+                                } else {
+                                    vt.text_primary
+                                })
+                                .child("变换"),
+                        );
+                    }
+                    tr_row = tr_row.child(tr_left);
+                    if !compact {
+                        tr_row = tr_row.child(
+                            div()
+                                .text_xs()
+                                .text_color(if tr_active {
+                                    vt.active_pill_text
+                                } else {
+                                    vt.text_muted
+                                })
+                                .child("^T"),
+                        );
+                    }
+                    panel = panel.child(tr_row);
+                }
+            }
         }
-        row.child(
+
+        // 外层居中容器不拦截空白处鼠标事件，确保画布可自由交互。
+        div()
+            .absolute()
+            .left(px(12.0))
+            .top(px(64.0))
+            .bottom(px(12.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(panel)
+    }
+
+    /// 右侧自适应高度属性检查器面板（颜色方形 SV + 下方色相条 + 粗细 + 文字底色 + 缩放）。
+    fn render_right_inspector(&self, cx: &mut Context<Self>, percent: &str) -> impl IntoElement {
+        let vt = ViewerTheme::current();
+        let view = cx.entity();
+        let (tool_name, _) = tool_label_and_key(self.tool);
+        let selected_list = self.selected_indices();
+        let badge_text: String = if selected_list.len() > 1 {
+            format!("已选 {} 项", selected_list.len())
+        } else if let Some(&idx) = selected_list.first()
+            && let Some(shape) = self.shapes.get(idx)
+        {
+            let kind = match shape {
+                Shape::Rect { .. } => "矩形",
+                Shape::Ellipse { .. } => "椭圆",
+                Shape::Line { .. } => "直线",
+                Shape::Arrow { .. } => "箭头",
+                Shape::Pen { .. } => "画笔",
+                Shape::Polygon { .. } => "多边形",
+                Shape::Highlighter { .. } => "荧光笔",
+                Shape::Mosaic { .. } => "马赛克",
+                Shape::Text { .. } => "文字",
+            };
+            format!("已选 · {kind}")
+        } else {
+            tool_name.to_string()
+        };
+        let sv_width = self
+            .sv_bounds
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|b| b.size.width.as_f32())
+            .unwrap_or(194.0);
+        let hue_width = self
+            .hue_bounds
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|b| b.size.width.as_f32())
+            .unwrap_or(194.0);
+        let (supports_color, supports_fill, _supports_stroke) = self.active_color_mode_flags();
+        let target_is_stroke = self.effective_target_stroke();
+        let active_opt_color = self.active_target_color();
+        let can_clear_target = if self.is_text_color_context() {
+            target_is_stroke && self.text_stroke_color.is_some()
+        } else if target_is_stroke {
+            self.anno_has_stroke
+                && (selected_list.is_empty()
+                    && matches!(self.tool, AnnoTool::Rect | AnnoTool::Ellipse)
+                    || selected_list.iter().any(|&i| {
+                        matches!(
+                            self.shapes.get(i),
+                            Some(
+                                Shape::Rect { .. } | Shape::Ellipse { .. } | Shape::Polygon { .. }
+                            )
+                        )
+                    }))
+        } else {
+            self.anno_fill.is_some()
+        };
+        let show_rect_radius = self.tool == AnnoTool::Rect
+            || selected_list
+                .iter()
+                .any(|&i| matches!(self.shapes.get(i), Some(Shape::Rect { .. })));
+        let hue = self.picker_hue;
+        let sat = self.picker_sat;
+        let val = self.picker_val;
+        let sv_bounds_ref = self.sv_bounds.clone();
+        let hue_bounds_ref = self.hue_bounds.clone();
+
+        let mut panel = div()
+            .id("viewer-right-inspector")
+            .occlude()
+            .w(px(244.0))
+            .p_3()
+            .rounded(px(18.0))
+            .bg(vt.panel_bg)
+            .border_1()
+            .border_color(vt.panel_border)
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _ev, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _, _cx| {
+                    this.sv_dragging = false;
+                    this.hue_dragging = false;
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                if this.sv_dragging {
+                    let sv_b = this.sv_bounds.lock().ok().and_then(|g| *g);
+                    if let Some(b) = sv_b {
+                        let w = b.size.width.as_f32().max(1.0);
+                        let h = b.size.height.as_f32().max(1.0);
+                        this.picker_sat =
+                            ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w).clamp(0.0, 1.0);
+                        this.picker_val = (1.0
+                            - (ev.position.y.as_f32() - b.origin.y.as_f32()) / h)
+                            .clamp(0.0, 1.0);
+                        this.apply_picker_hsv(cx);
+                    }
+                } else if this.hue_dragging {
+                    let hue_b = this.hue_bounds.lock().ok().and_then(|g| *g);
+                    if let Some(b) = hue_b {
+                        let w = b.size.width.as_f32().max(1.0);
+                        let t =
+                            ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w).clamp(0.0, 1.0);
+                        this.picker_hue = t * 360.0;
+                        this.apply_picker_hsv(cx);
+                    }
+                }
+                cx.stop_propagation();
+            }))
+            .on_scroll_wheel(cx.listener(|_, _ev, _, cx| cx.stop_propagation()))
+            // 顶部标题 + 当前选中工具/元素徽章
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_1()
+                    .child(div().text_sm().text_color(vt.text_primary).child("属性"))
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded_full()
+                            .bg(vt.card_bg)
+                            .border_1()
+                            .border_color(vt.inner_border)
+                            .text_xs()
+                            .text_color(vt.text_primary)
+                            .child(badge_text),
+                    ),
+            );
+        if selected_list.len() >= 2 {
+            let align_btn = |id: &'static str, label: &'static str, mode: AlignMode| {
+                let v = view.clone();
+                div()
+                    .id(id)
+                    .flex_1()
+                    .py(px(4.0))
+                    .rounded(px(7.0))
+                    .bg(vt.panel_bg)
+                    .border_1()
+                    .border_color(vt.inner_border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(vt.text_primary)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(vt.hover_bg))
+                    .child(label)
+                    .on_click(move |_, window, cx| {
+                        v.update(cx, |this, cx| {
+                            this.handle(ViewerAction::Align(mode), window, cx);
+                        });
+                    })
+            };
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .rounded(px(14.0))
+                    .bg(vt.card_bg)
+                    .border_1()
+                    .border_color(vt.inner_border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(div().text_xs().text_color(vt.text_secondary).child("对齐"))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(align_btn("align-top", "顶对齐", AlignMode::Top))
+                            .child(align_btn("align-left", "左对齐", AlignMode::Left))
+                            .child(align_btn("align-bottom", "底对齐", AlignMode::Bottom)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(align_btn("align-right", "右对齐", AlignMode::Right))
+                            .child(align_btn("align-ch", "水平居中", AlignMode::CenterH))
+                            .child(align_btn("align-cv", "垂直居中", AlignMode::CenterV)),
+                    ),
+            );
+        }
+        if supports_color {
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .rounded(px(14.0))
+                    .bg(vt.card_bg)
+                    .border_1()
+                    .border_color(vt.inner_border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(9.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_xs().text_color(vt.text_secondary).child("颜色"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child({
+                                        let v_fill = view.clone();
+                                        let v_stroke = view.clone();
+                                        let v_clear = view.clone();
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(3.0))
+                                            .when(supports_fill, |d| {
+                                                d.child(
+                                                    div()
+                                                        .id("pick-target-fill")
+                                                        .px_2()
+                                                        .py(px(1.0))
+                                                        .rounded_full()
+                                                        .text_xs()
+                                                        .cursor_pointer()
+                                                        .bg(if !target_is_stroke {
+                                                            vt.active_pill_bg
+                                                        } else {
+                                                            rgba(0x00000000)
+                                                        })
+                                                        .text_color(if !target_is_stroke {
+                                                            vt.active_pill_text
+                                                        } else {
+                                                            vt.text_muted
+                                                        })
+                                                        .child("填充")
+                                                        .on_click(move |_, window, cx| {
+                                                            v_fill.update(cx, |this, cx| {
+                                                                this.handle(
+                                                                    ViewerAction::PickBg(false),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .id("pick-target-stroke")
+                                                    .px_2()
+                                                    .py(px(1.0))
+                                                    .rounded_full()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .bg(if target_is_stroke {
+                                                        vt.active_pill_bg
+                                                    } else {
+                                                        rgba(0x00000000)
+                                                    })
+                                                    .text_color(if target_is_stroke {
+                                                        vt.active_pill_text
+                                                    } else {
+                                                        vt.text_muted
+                                                    })
+                                                    .child("描边")
+                                                    .on_click(move |_, window, cx| {
+                                                        v_stroke.update(cx, |this, cx| {
+                                                            this.handle(
+                                                                ViewerAction::PickBg(true),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            )
+                                            .when(can_clear_target, |d| {
+                                                d.child(
+                                                    div()
+                                                        .id("pick-target-clear")
+                                                        .px(px(5.0))
+                                                        .py(px(1.0))
+                                                        .rounded_full()
+                                                        .text_xs()
+                                                        .cursor_pointer()
+                                                        .bg(vt.hover_bg)
+                                                        .text_color(vt.text_secondary)
+                                                        .child("无")
+                                                        .on_click(move |_, window, cx| {
+                                                            v_clear.update(cx, |this, cx| {
+                                                                this.handle(
+                                                                    ViewerAction::ClearOptionalColor,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                )
+                                            })
+                                    })
+                                    .child(
+                                        div()
+                                            .w(px(13.0))
+                                            .h(px(13.0))
+                                            .rounded(px(4.0))
+                                            .border_1()
+                                            .border_color(vt.panel_border)
+                                            .bg(if let Some(c) = active_opt_color {
+                                                c.to_rgpui()
+                                            } else {
+                                                rgba(0x00000000)
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(vt.text_primary)
+                                            .child(
+                                                active_opt_color
+                                                    .map(|c| c.to_hex())
+                                                    .unwrap_or_else(|| "无".to_string()),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    // 圆角方形 SV 取色区
+                    .child(
+                        div()
+                            .id("viewer-sv-box")
+                            .relative()
+                            .w_full()
+                            .h(px(116.0))
+                            .rounded(px(10.0))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(vt.inner_border)
+                            .cursor(CursorStyle::Crosshair)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.sv_dragging = true;
+                                    let sv_b = this.sv_bounds.lock().ok().and_then(|g| *g);
+                                    if let Some(b) = sv_b {
+                                        let w = b.size.width.as_f32().max(1.0);
+                                        let h = b.size.height.as_f32().max(1.0);
+                                        this.picker_sat =
+                                            ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w)
+                                                .clamp(0.0, 1.0);
+                                        this.picker_val = (1.0
+                                            - (ev.position.y.as_f32() - b.origin.y.as_f32()) / h)
+                                            .clamp(0.0, 1.0);
+                                        this.apply_picker_hsv(cx);
+                                    }
+                                }),
+                            )
+                            .child(
+                                canvas(
+                                    move |bounds, _, _| bounds,
+                                    move |_bounds, paint_bounds, window, _| {
+                                        if let Ok(mut guard) = sv_bounds_ref.lock() {
+                                            *guard = Some(paint_bounds);
+                                        }
+                                        let cols = 96usize;
+                                        let rows = 58usize;
+                                        let cw = paint_bounds.size.width.as_f32() / cols as f32;
+                                        let ch = paint_bounds.size.height.as_f32() / rows as f32;
+                                        let ox = paint_bounds.origin.x.as_f32();
+                                        let oy = paint_bounds.origin.y.as_f32();
+                                        for r in 0..rows {
+                                            let v = 1.0 - (r as f32 + 0.5) / rows as f32;
+                                            for c in 0..cols {
+                                                let s = (c as f32 + 0.5) / cols as f32;
+                                                let cell = Bounds {
+                                                    origin: point(
+                                                        px(ox + c as f32 * cw),
+                                                        px(oy + r as f32 * ch),
+                                                    ),
+                                                    size: size(px(cw + 0.6), px(ch + 0.6)),
+                                                };
+                                                window.paint_quad(fill(
+                                                    cell,
+                                                    hsv_to_anno(hue, s, v).to_rgpui(),
+                                                ));
+                                            }
+                                        }
+                                    },
+                                )
+                                .size_full(),
+                            )
+                            // SV 准星圆圈
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px((sat * sv_width - 6.0)
+                                        .clamp(0.0, (sv_width - 12.0).max(0.0))))
+                                    .top(px(((1.0 - val) * 116.0 - 6.0).clamp(0.0, 104.0)))
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .rounded_full()
+                                    .border_2()
+                                    .border_color(rgb(0xFFFFFF)),
+                            ),
+                    )
+                    // 下方横向圆角色相条
+                    .child(
+                        div()
+                            .id("viewer-hue-bar")
+                            .relative()
+                            .w_full()
+                            .h(px(12.0))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(vt.inner_border)
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.hue_dragging = true;
+                                    let hue_b = this.hue_bounds.lock().ok().and_then(|g| *g);
+                                    if let Some(b) = hue_b {
+                                        let w = b.size.width.as_f32().max(1.0);
+                                        let t = ((ev.position.x.as_f32() - b.origin.x.as_f32())
+                                            / w)
+                                            .clamp(0.0, 1.0);
+                                        this.picker_hue = t * 360.0;
+                                        this.apply_picker_hsv(cx);
+                                    }
+                                }),
+                            )
+                            .child(
+                                canvas(
+                                    move |bounds, _, _| bounds,
+                                    move |_bounds, paint_bounds, window, _| {
+                                        if let Ok(mut guard) = hue_bounds_ref.lock() {
+                                            *guard = Some(paint_bounds);
+                                        }
+                                        let segs = 100usize;
+                                        let sw = paint_bounds.size.width.as_f32() / segs as f32;
+                                        let ox = paint_bounds.origin.x.as_f32();
+                                        let oy = paint_bounds.origin.y.as_f32();
+                                        let h = paint_bounds.size.height;
+                                        for i in 0..segs {
+                                            let hh = (i as f32 + 0.5) / segs as f32 * 360.0;
+                                            let seg = Bounds {
+                                                origin: point(px(ox + i as f32 * sw), px(oy)),
+                                                size: size(px(sw + 0.6), h),
+                                            };
+                                            window.paint_quad(fill(
+                                                seg,
+                                                hsv_to_anno(hh, 1.0, 1.0).to_rgpui(),
+                                            ));
+                                        }
+                                    },
+                                )
+                                .size_full(),
+                            )
+                            // 色相滑块指示圆点
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(((hue / 360.0) * hue_width - 6.0)
+                                        .clamp(0.0, (hue_width - 12.0).max(0.0))))
+                                    .top(px(0.0))
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .rounded_full()
+                                    .bg(rgb(0xFFFFFF))
+                                    .border_1()
+                                    .border_color(rgba(0x00000055)),
+                            ),
+                    )
+                    // 6 快捷预设色圆点
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(self.color_swatch(cx, AnnoColor::RED))
+                            .child(self.color_swatch(cx, AnnoColor::YELLOW))
+                            .child(self.color_swatch(cx, AnnoColor::GREEN))
+                            .child(self.color_swatch(cx, AnnoColor::BLUE))
+                            .child(self.color_swatch(cx, AnnoColor::WHITE))
+                            .child(self.color_swatch(cx, AnnoColor::BLACK)),
+                    ),
+            );
+            // 2. 描边粗细卡片（马赛克时不显示）
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .rounded(px(14.0))
+                    .bg(vt.card_bg)
+                    .border_1()
+                    .border_color(vt.inner_border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(vt.text_secondary)
+                                    .child(tr("viewer.line_width")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(vt.text_primary)
+                                    .child(format!("{} px", self.width.round() as u32)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.step_pill(
+                                cx,
+                                "w-down",
+                                "−",
+                                ViewerAction::WidthNudge(-1.0),
+                            ))
+                            .child(div().flex_1().child(Slider::new(&self.width_slider)))
+                            .child(self.step_pill(cx, "w-up", "+", ViewerAction::WidthNudge(1.0))),
+                    ),
+            );
+        }
+        if show_rect_radius {
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .rounded(px(14.0))
+                    .bg(vt.card_bg)
+                    .border_1()
+                    .border_color(vt.inner_border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_xs().text_color(vt.text_secondary).child("圆角"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(vt.text_primary)
+                                    .child(format!("{} px", self.anno_rect_radius.round() as u32)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.step_pill(
+                                cx,
+                                "rad-down",
+                                "−",
+                                ViewerAction::RectRadiusNudge(-2.0),
+                            ))
+                            .child(div().flex_1().child(Slider::new(&self.rect_radius_slider)))
+                            .child(self.step_pill(
+                                cx,
+                                "rad-up",
+                                "+",
+                                ViewerAction::RectRadiusNudge(2.0),
+                            )),
+                    ),
+            );
+        }
+        if self.tool == AnnoTool::Text
+            || self.text_editing.is_some()
+            || selected_list
+                .iter()
+                .any(|&i| matches!(self.shapes.get(i), Some(Shape::Text { .. })))
+        {
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .rounded(px(14.0))
+                    .bg(vt.card_bg)
+                    .border_1()
+                    .border_color(vt.inner_border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .h(px(14.0))
+                                            .rounded(px(4.0))
+                                            .bg(self.text_bg_color.as_text_bg_rgpui())
+                                            .border_1()
+                                            .border_color(vt.panel_border),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(vt.text_primary)
+                                            .child(tr("viewer.text_bg")),
+                                    ),
+                            )
+                            .child({
+                                let view_sw = view.clone();
+                                let on = self.text_bg;
+                                div()
+                                    .id("viewer-text-bg-switch")
+                                    .w(px(36.0))
+                                    .h(px(20.0))
+                                    .p(px(2.0))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .bg(if on { vt.accent } else { vt.hover_bg })
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .when(!on, |d| d.justify_start())
+                                    .child(
+                                        div()
+                                            .w(px(16.0))
+                                            .h(px(16.0))
+                                            .rounded_full()
+                                            .bg(rgb(0xFFFFFF)),
+                                    )
+                                    .on_click(move |_, window, cx| {
+                                        view_sw.update(cx, |this, cx| {
+                                            this.handle(ViewerAction::TextBg, window, cx);
+                                        });
+                                    })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_xs().text_color(vt.text_secondary).child("字号"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .w(px(44.0))
+                                            .h(px(22.0))
+                                            .px_1()
+                                            .rounded(px(6.0))
+                                            .bg(vt.hover_bg)
+                                            .border_1()
+                                            .border_color(vt.inner_border)
+                                            .flex()
+                                            .items_center()
+                                            .child(
+                                                Input::new(&self.text_size_input)
+                                                    .appearance(false)
+                                                    .bordered(false)
+                                                    .focus_bordered(false)
+                                                    .p_0()
+                                                    .text_xs()
+                                                    .text_color(vt.text_primary),
+                                            ),
+                                    )
+                                    .child(div().text_xs().text_color(vt.text_muted).child("px")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.step_pill(
+                                cx,
+                                "ts-down",
+                                "−",
+                                ViewerAction::TextSizeNudge(-2.0),
+                            ))
+                            .child(div().flex_1().child(Slider::new(&self.text_size_slider)))
+                            .child(self.step_pill(
+                                cx,
+                                "ts-up",
+                                "+",
+                                ViewerAction::TextSizeNudge(2.0),
+                            )),
+                    )
+                    .child({
+                        let active_font_label = self
+                            .text_font
+                            .as_deref()
+                            .unwrap_or("默认 (微软雅黑)")
+                            .to_string();
+                        let sys_fonts = crate::export::system_font_list();
+                        let view_dd = view.clone();
+                        let view_def = view.clone();
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(5.0))
+                            .child(div().text_xs().text_color(vt.text_secondary).child("字体"))
+                            .child(
+                                div()
+                                    .id("viewer-font-dropdown-trigger")
+                                    .h(px(28.0))
+                                    .px_2()
+                                    .rounded(px(8.0))
+                                    .bg(vt.hover_bg)
+                                    .border_1()
+                                    .border_color(vt.inner_border)
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_xs()
+                                            .text_color(vt.text_primary)
+                                            .child(active_font_label),
+                                    )
+                                    .child(div().text_xs().text_color(vt.text_muted).child(
+                                        if self.font_dropdown_open {
+                                            "▴"
+                                        } else {
+                                            "▾"
+                                        },
+                                    ))
+                                    .on_click(move |_, window, cx| {
+                                        view_dd.update(cx, |this, cx| {
+                                            this.handle(
+                                                ViewerAction::ToggleFontDropdown,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            )
+                            .when(self.font_dropdown_open, |col| {
+                                let mut inner =
+                                    div().w_full().flex().flex_col().gap(px(2.0)).child(
+                                        div()
+                                            .id("viewer-font-opt-default")
+                                            .w_full()
+                                            .flex_shrink_0()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(px(6.0))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .bg(if self.text_font.is_none() {
+                                                vt.active_pill_bg
+                                            } else {
+                                                rgba(0x00000000)
+                                            })
+                                            .text_color(if self.text_font.is_none() {
+                                                vt.active_pill_text
+                                            } else {
+                                                vt.text_primary
+                                            })
+                                            .hover(move |s| s.bg(vt.hover_bg))
+                                            .child("默认 (微软雅黑)")
+                                            .on_click(move |_, window, cx| {
+                                                view_def.update(cx, |this, cx| {
+                                                    this.handle(
+                                                        ViewerAction::TextFont(None),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                    );
+                                for (idx, (name, _)) in sys_fonts.iter().enumerate() {
+                                    let is_sel = self.text_font.as_deref() == Some(name.as_str());
+                                    let fam = name.clone();
+                                    let view_item = view.clone();
+                                    inner = inner.child(
+                                        div()
+                                            .id(format!("viewer-font-opt-{idx}"))
+                                            .w_full()
+                                            .flex_shrink_0()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(px(6.0))
+                                            .text_xs()
+                                            .whitespace_nowrap()
+                                            .overflow_hidden()
+                                            .cursor_pointer()
+                                            .bg(if is_sel {
+                                                vt.active_pill_bg
+                                            } else {
+                                                rgba(0x00000000)
+                                            })
+                                            .text_color(if is_sel {
+                                                vt.active_pill_text
+                                            } else {
+                                                vt.text_primary
+                                            })
+                                            .hover(move |s| s.bg(vt.hover_bg))
+                                            .child(name.clone())
+                                            .on_click(move |_, window, cx| {
+                                                view_item.update(cx, |this, cx| {
+                                                    this.handle(
+                                                        ViewerAction::TextFont(Some(fam.clone())),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                    );
+                                }
+                                col.child(
+                                    div()
+                                        .id("viewer-font-dropdown-list")
+                                        .w_full()
+                                        .h(px(170.0))
+                                        .overflow_y_scroll()
+                                        .p_1()
+                                        .rounded(px(10.0))
+                                        .bg(vt.panel_bg)
+                                        .border_1()
+                                        .border_color(vt.panel_border)
+                                        .child(inner),
+                                )
+                            })
+                    }),
+            );
+        }
+        // 4. 画布缩放卡片
+        panel = panel.child(
             div()
-                .flex_shrink_0()
+                .p_3()
+                .rounded(px(14.0))
+                .bg(vt.card_bg)
+                .border_1()
+                .border_color(vt.inner_border)
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(vt.text_secondary)
+                                .child("画布视图"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(vt.text_primary)
+                                .child(percent.to_string()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(self.step_pill(cx, "z-out", "−", ViewerAction::ZoomOut))
+                        .child({
+                            let view_fit = view.clone();
+                            div()
+                                .id("viewer-fit-pill")
+                                .flex_1()
+                                .h(px(26.0))
+                                .rounded_full()
+                                .bg(vt.hover_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .text_color(vt.text_primary)
+                                .cursor_pointer()
+                                .hover(move |s| {
+                                    s.bg(vt.active_pill_bg).text_color(vt.active_pill_text)
+                                })
+                                .child(tr("viewer.fit"))
+                                .on_click(move |_, window, cx| {
+                                    view_fit.update(cx, |this, cx| {
+                                        this.handle(ViewerAction::Fit, window, cx);
+                                    });
+                                })
+                        })
+                        .child(self.step_pill(cx, "z-in", "+", ViewerAction::ZoomIn)),
+                ),
+        );
+
+        // 保存成功后出现快捷打开入口卡片。
+        if self.last_saved.is_some() {
+            panel = panel.child(
+                div()
+                    .p_2()
+                    .rounded(px(14.0))
+                    .bg(vt.card_bg)
+                    .border_1()
+                    .border_color(vt.inner_border)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.capsule_btn(
+                        cx,
+                        "open-saved-file",
+                        tr("viewer.open_file"),
+                        ViewerAction::OpenSavedFile,
+                    ))
+                    .child(self.capsule_btn(
+                        cx,
+                        "open-saved-dir",
+                        tr("viewer.open_dir"),
+                        ViewerAction::OpenSavedDir,
+                    )),
+            );
+        }
+
+        // 外层居中容器不拦截空白处鼠标事件。
+        div()
+            .absolute()
+            .right(px(12.0))
+            .top(px(64.0))
+            .bottom(px(12.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(panel)
+    }
+
+    /// 渲染左下角 3 秒渐隐状态提示胶囊（前 2.4 秒完全不透明，后 0.6 秒渐隐至 0）。
+    fn render_bottom_status(&self) -> Option<impl IntoElement> {
+        let start = self.status_at?;
+        let elapsed = start.elapsed().as_secs_f32();
+        if elapsed >= 3.0 {
+            return None;
+        }
+        let alpha = if elapsed <= 2.4 {
+            1.0
+        } else {
+            ((3.0 - elapsed) / 0.6).clamp(0.0, 1.0)
+        };
+        let vt = ViewerTheme::current();
+        let fade = |mut c: Rgba| -> Rgba {
+            c.a *= alpha;
+            c
+        };
+        Some(
+            div()
+                .absolute()
+                .left(px(12.0))
+                .bottom(px(12.0))
+                .max_w(px(720.0))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .px_3()
+                .py_1()
+                .rounded_full()
+                .bg(fade(vt.panel_bg))
+                .border_1()
+                .border_color(fade(vt.panel_border))
                 .text_xs()
-                .text_color(rgb(0x888888))
-                .child(info),
+                .text_color(fade(vt.text_primary))
+                .child(self.status.to_string()),
         )
+    }
+
+    /// 圆形小步进按钮（线宽、缩放通用）。
+    fn step_pill(
+        &self,
+        cx: &mut Context<Self>,
+        id: &str,
+        label: &'static str,
+        action: ViewerAction,
+    ) -> impl IntoElement {
+        let vt = ViewerTheme::current();
+        let view = cx.entity();
+        div()
+            .id(format!("viewer-step-{id}"))
+            .w(px(24.0))
+            .h(px(24.0))
+            .rounded_full()
+            .bg(vt.hover_bg)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .text_color(vt.text_primary)
+            .cursor_pointer()
+            .child(label)
+            .on_click(move |_, window, cx| {
+                let act = action.clone();
+                view.update(cx, |this, cx| this.handle(act, window, cx));
+            })
     }
 }
 
@@ -2906,6 +6277,28 @@ mod tests {
     use super::*;
     use crate::shapes::PixelRect;
 
+    /// 控制点的缩放方向必须与 Windows 系统光标一致。
+    #[test]
+    fn transform_cursor_directions() {
+        assert_eq!(
+            transform_cursor(Some(TransformHandle::Nw)),
+            CursorStyle::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            transform_cursor(Some(TransformHandle::Ne)),
+            CursorStyle::ResizeUpRightDownLeft
+        );
+        assert_eq!(
+            transform_cursor(Some(TransformHandle::S)),
+            CursorStyle::ResizeUpDown
+        );
+        assert_eq!(
+            transform_cursor(Some(TransformHandle::W)),
+            CursorStyle::ResizeLeftRight
+        );
+        assert_eq!(transform_cursor(None), CursorStyle::Arrow);
+    }
+
     /// 橡皮擦：矩形按外包矩形命中，画笔按笔迹距离命中，未命中返回 None。
     #[test]
     fn erase_hit_cases() {
@@ -2914,6 +6307,9 @@ mod tests {
                 rect: PixelRect::new(10.0, 10.0, 50.0, 40.0),
                 color: AnnoColor::RED,
                 width: 3.0,
+                fill: None,
+                has_stroke: true,
+                radius: 0.0,
             },
             Shape::Pen {
                 pts: vec![(100.0, 100.0), (200.0, 100.0)],
@@ -2931,6 +6327,206 @@ mod tests {
         assert_eq!(erase_hit(&shapes, (300.0, 300.0), 8.0), None);
     }
 
+    /// 明暗双层光标在不同 DPI 下分别保持 3/1 个物理像素的宽度。
+    #[test]
+    fn caret_has_light_outline_and_dark_core_at_any_dpi() {
+        for dpi in [1.0, 1.5, 2.0] {
+            let (outer, inner) = caret_layers(
+                Bounds::new(point(px(20.25), px(30.0)), size(px(0.0), px(42.0))),
+                dpi,
+            );
+            assert!((outer.size.width.as_f32() * dpi - 3.0).abs() < 0.001);
+            assert!((inner.size.width.as_f32() * dpi - 1.0).abs() < 0.001);
+            assert!(outer.left() < inner.left() && outer.right() > inner.right());
+            assert!(outer.top() < inner.top() && outer.bottom() > inner.bottom());
+        }
+    }
+
+    /// 变换八个点与框内命中，移动保持尺寸，缩放不穿越对侧形成负数。
+    #[test]
+    fn transform_handles_resize_and_move() {
+        let bounds = PixelRect::new(10.0, 20.0, 100.0, 60.0);
+        assert_eq!(
+            transform_hit(bounds, (110.0, 80.0), 1.0),
+            Some(TransformHandle::Se)
+        );
+        assert_eq!(
+            transform_hit(bounds, (60.0, 50.0), 1.0),
+            Some(TransformHandle::Move)
+        );
+        assert_eq!(transform_hit(bounds, (300.0, 200.0), 1.0), None);
+        let moved = resize_bounds(bounds, (5.0, -10.0), TransformHandle::Move, false);
+        assert_eq!(
+            (moved.x, moved.y, moved.w, moved.h),
+            (15.0, 10.0, 100.0, 60.0)
+        );
+        let resized = resize_bounds(bounds, (100.0, 60.0), TransformHandle::Se, true);
+        assert_eq!(
+            (resized.x, resized.y, resized.w, resized.h),
+            (10.0, 20.0, 200.0, 120.0)
+        );
+        let smaller = resize_bounds(bounds, (-50.0, 0.0), TransformHandle::Se, true);
+        assert_eq!((smaller.w, smaller.h), (50.0, 30.0));
+        let limited = resize_bounds(bounds, (500.0, 500.0), TransformHandle::Nw, false);
+        assert_eq!((limited.w, limited.h), (2.0, 2.0));
+        assert_eq!(
+            (limited.x + limited.w, limited.y + limited.h),
+            (110.0, 80.0)
+        );
+    }
+
+    /// 文字缩放真正改变字号，源快照保持不变，可用于 Esc 恢复。
+    #[test]
+    fn transform_text_preserves_scaled_font_size_and_source() {
+        let source = Shape::Text {
+            pos: (10.0, 20.0),
+            content: "测试".into(),
+            color: AnnoColor::RED,
+            size: 28.0,
+            bg: false,
+            bg_color: AnnoColor::WHITE,
+            max_w: None,
+            font_family: None,
+            stroke_color: None,
+            stroke_width: 3.0,
+        };
+        let from = PixelRect::new(10.0, 20.0, 56.0, 42.0);
+        let result = transform_shape(
+            &source,
+            from,
+            PixelRect::new(30.0, 40.0, 112.0, 84.0),
+            false,
+        );
+        let Shape::Text {
+            pos, size, color, ..
+        } = result
+        else {
+            panic!("Expected text")
+        };
+        assert_eq!(pos, (30.0, 40.0));
+        assert_eq!(size, 56.0);
+        assert_eq!(color, AnnoColor::RED);
+        assert!(matches!(source, Shape::Text { size: 28.0, .. }));
+        let rect = Shape::Rect {
+            rect: PixelRect::new(10.0, 20.0, 56.0, 42.0),
+            color: AnnoColor::BLUE,
+            width: 2.0,
+            fill: None,
+            has_stroke: true,
+            radius: 0.0,
+        };
+        assert!(matches!(
+            transform_shape(&rect, from, PixelRect::new(30.0, 40.0, 112.0, 84.0), false),
+            Shape::Rect { width: 4.0, .. }
+        ));
+    }
+
+    /// 新快捷键逐项覆盖，旧数字键仍可兼容。
+    #[test]
+    fn named_annotation_shortcuts() {
+        for (key, tool) in [
+            ("r", AnnoTool::Rect),
+            ("l", AnnoTool::Line),
+            ("o", AnnoTool::Ellipse),
+            ("i", AnnoTool::Eyedropper),
+            ("e", AnnoTool::Eraser),
+            ("t", AnnoTool::Text),
+            ("v", AnnoTool::Select),
+            ("b", AnnoTool::Pen),
+            ("m", AnnoTool::Mosaic),
+        ] {
+            assert_eq!(AnnoTool::from_shortcut(key), Some(tool));
+        }
+    }
+
+    /// 草稿平移保持尺寸，碰边返回实际位移，供起终点同步后继续绘制。
+    #[test]
+    fn moving_draft_preserves_geometry_and_clamps_edges() {
+        let mut shape = Shape::Rect {
+            rect: PixelRect::new(10.0, 20.0, 40.0, 30.0),
+            color: AnnoColor::RED,
+            width: 2.0,
+            fill: None,
+            has_stroke: true,
+            radius: 0.0,
+        };
+        let original = shape.bbox();
+        assert_eq!(
+            translate_draft(&mut shape, (30.0, -10.0), (200.0, 100.0)),
+            (30.0, -10.0)
+        );
+        assert_eq!((shape.bbox().w, shape.bbox().h), (original.w, original.h));
+        let moved = translate_draft(&mut shape, (-999.0, 999.0), (200.0, 100.0));
+        assert_eq!(moved, (-38.0, 58.0));
+        assert_eq!(shape.bbox().x, 0.0);
+        assert_eq!(shape.bbox().y + shape.bbox().h, 100.0);
+        let line = Shape::Line {
+            from: (10.0, 10.0),
+            to: (50.0, 10.0),
+            color: AnnoColor::BLUE,
+            width: 2.0,
+        };
+        assert!(draft_valid(&line));
+        assert_eq!(erase_hit(&[line], (30.0, 10.0), 2.0), Some(0));
+    }
+
+    /// 已有元素自由移动时不受画布边界限制，可移至负坐标或超出底图范围。
+    #[test]
+    fn move_shape_allows_moving_outside_canvas() {
+        let mut rect = Shape::Rect {
+            rect: PixelRect::new(10.0, 20.0, 40.0, 30.0),
+            color: AnnoColor::RED,
+            width: 2.0,
+            fill: None,
+            has_stroke: true,
+            radius: 0.0,
+        };
+        let original = rect.bbox();
+        move_shape(&mut rect, (-100.0, -50.0));
+        assert_eq!(rect.bbox().x, original.x - 100.0);
+        assert_eq!(rect.bbox().y, original.y - 50.0);
+
+        move_shape(&mut rect, (400.0, 300.0));
+        assert_eq!(rect.bbox().x, original.x + 300.0);
+        assert_eq!(rect.bbox().y, original.y + 250.0);
+    }
+
+    /// 取色只读原图，边界不会越界采样，也不使用红蓝互换的渲染缓存。
+    #[test]
+    fn eyedropper_samples_original_rgba() {
+        let image = RgbaImage::from_pixel(2, 3, image::Rgba([15, 90, 200, 123]));
+        assert_eq!(
+            sample_image_color(&image, (1.9, 2.9)),
+            Some(AnnoColor(15, 90, 200, 255))
+        );
+        assert_eq!(sample_image_color(&image, (-0.1, 0.0)), None);
+        assert_eq!(sample_image_color(&image, (2.0, 0.0)), None);
+    }
+
+    /// 关闭导出烧录真正直线，保持原图不变；生成有效 PNG，包含完整尺寸。
+    #[test]
+    fn close_export_contains_annotations_without_modifying_source() {
+        let base = Arc::new(RgbaImage::from_pixel(
+            100,
+            80,
+            image::Rgba([255, 255, 255, 255]),
+        ));
+        let shape = Shape::Line {
+            from: (10.0, 20.0),
+            to: (80.0, 20.0),
+            color: AnnoColor::RED,
+            width: 2.0,
+        };
+        let (png, path) =
+            annotation_png(Some(base.clone()), std::path::Path::new("unused"), &[shape]).unwrap();
+        let output = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(output.dimensions(), (100, 80));
+        assert_eq!(output.get_pixel(40, 20).0, [231, 76, 60, 255]);
+        assert_eq!(output.get_pixel(78, 15).0, [255, 255, 255, 255]);
+        assert_eq!(base.get_pixel(40, 20).0, [255, 255, 255, 255]);
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// 橡皮擦：重叠时删最顶层（后画的）。
     #[test]
     fn erase_hit_topmost() {
@@ -2939,11 +6535,17 @@ mod tests {
                 rect: PixelRect::new(0.0, 0.0, 100.0, 100.0),
                 color: AnnoColor::RED,
                 width: 3.0,
+                fill: None,
+                has_stroke: true,
+                radius: 0.0,
             },
             Shape::Rect {
                 rect: PixelRect::new(50.0, 50.0, 100.0, 100.0),
                 color: AnnoColor::BLUE,
                 width: 3.0,
+                fill: None,
+                has_stroke: true,
+                radius: 0.0,
             },
         ];
         assert_eq!(erase_hit(&shapes, (75.0, 75.0), 8.0), Some(1));
@@ -3002,6 +6604,9 @@ mod tests {
                 rect: PixelRect::new(0.0, 0.0, 10.0, 10.0),
                 color: AnnoColor::RED,
                 width: 2.0,
+                fill: None,
+                has_stroke: true,
+                radius: 0.0,
             },
             Shape::Text {
                 pos: (0.0, 0.0),
@@ -3010,6 +6615,10 @@ mod tests {
                 size: 20.0,
                 bg: true,
                 bg_color: AnnoColor::BLACK,
+                max_w: None,
+                font_family: None,
+                stroke_color: None,
+                stroke_width: 3.0,
             },
             Shape::Text {
                 pos: (5.0, 5.0),
@@ -3018,6 +6627,10 @@ mod tests {
                 size: 20.0,
                 bg: false,
                 bg_color: AnnoColor::WHITE,
+                max_w: None,
+                font_family: None,
+                stroke_color: None,
+                stroke_width: 3.0,
             },
         ];
         // 取最后一条文字，而不是第一条。

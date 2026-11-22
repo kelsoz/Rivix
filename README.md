@@ -1,241 +1,167 @@
-# Rupix · 拾景
+# Rivix · 望川
 
-<img src="assets/logo.png" width="112" alt="Rupix logo" align="right" />
+<img src="assets/logo-light.png" width="88" alt="Rivix 望川 logo" align="right" />
 
-**看到 → 截取 → 留存。** 一款用 Rust + rgpui 写的轻量级跨平台截图工具：
-托盘常驻、全局热键、截完即存即复制，需要时再标注、取色或离线识别文字。
+**看到 → 截取 → 留存；静可拾景，动可望川。**
 
-[![CI](https://github.com/launcher-rs/rupix/actions/workflows/ci.yml/badge.svg)](https://github.com/launcher-rs/rupix/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/launcher-rs/rupix)](https://github.com/launcher-rs/rupix/releases)
+基于 **Rust + [rgpui](https://crates.io/crates/rgpui)** 构建的原生轻量级截图与录屏工具。常驻托盘、毫秒级唤起、单热键分叉直达高频动作，截完即粘、录屏稳健、标注顺手。
+
+[![CI](https://github.com/kelsoz/Rivix/actions/workflows/ci.yml/badge.svg)](https://github.com/kelsoz/Rivix/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kelsoz/Rivix)](https://github.com/kelsoz/Rivix/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
-## 核心特点
+![标注编辑](assets/screenshots/viewer.png)
 
-- **截完直接能粘**：热键 → 自动存新文件 → 自动进剪贴板，焦点不离开当前程序，`Ctrl + V` 即可；
-- **标注可改、文字可用**：矢量标注随时撤销重做；离线 OCR 结果能复制，也能落回图里成为文字标注；
-- **顺手且可脚本化**：托盘常驻、取色即复制 HEX，`rupix -f` / `-r x,y,w,h` 可被脚本直接调用；
-- **Rust 原生、单文件便携**：没有 Electron / WebView，配置就在 exe 旁边，解压即用；
-  Windows / Linux / macOS 同一套交互。
+---
 
-## 界面截图
+## 为什么做「望川」？
 
-| 设置页（截图入口 + 行为开关） | 标注编辑（矢量标注 + 撤销重做） |
+好用的截图工具并不多，兜兜转转往往只剩两种妥协：
+
+- **太简陋**：多屏混合 DPI 缩放发虚、HDR 色彩发灰、标注工具粗糙难用；
+- **太臃肿**：设置页塞满几十个开关，启动慢、唤起卡，后台常驻吃掉几百兆内存。
+
+「望川（Rivix）」源自开源 Rust 项目 **[rupix](https://github.com/launcher-rs/rupix)**。在继承其无 Electron、无 WebView 轻量骨架的基础上，我们从 UI 视觉、交互动线到多屏渲染与标注引擎做了一轮彻底重塑：
+
+> **「拾景」是静态的定格，「望川」则是流水般的动态。**  
+> 在静帧截图、贴图与矢量标注之外，望川集成了由 **FFmpeg** 驱动的轻量录屏能力，从瞬时定格到流畅录制，始终保持克制、稳定与高效。
+
+> **绿色免安装 · 极简便携**：  
+> 无需安装向导，不写杂乱系统目录。核心程序仅为**单个 `rivix.exe`（约 17 MB）**，配置文件 `rivix-config.json` 与程序同目录存放；截图、标注、Pin 图、取色、扫码全部单文件开箱即用，仅录屏时按需调用同目录或 `PATH` 中的 `ffmpeg.exe`。
+
+---
+
+## 设计哲学：一个入口，万千分支
+
+好的效率工具，不该强迫人背诵五六个全局热键，也不该在每次截完图后弹出笨重的大窗口。
+
+望川遵循一条符合肌肉记忆的主线：**一个热键唤起，过程中随心分叉。**
+
+1. **单一入口唤醒**：只需记住 `Insert`（可在设置中自定义），全屏瞬间定格，鼠标悬停即可自动吸附窗口边界。
+2. **高频路径零阻力**：框选后**松开左键即复制**，焦点不离开当前文档或 IDE，直接 `Ctrl + V` 粘贴；右下角仅浮起一枚轻巧的提示胶囊，绝不打断思路，也不会被下一张截图录进去。
+3. **指尖直达进阶分支**：所有按键都严格对应动作的英文首字母或设计软件肌肉记忆，**见字知意、符合直觉**——框选期间只需轻按一个键即可原地切换：
+   - **`Space`（按住 · 空格抓手）**：平移整个选区，松开继续微调大小（延续设计软件按住空格拖动画布的直觉）
+   - **`F`（Fullscreen）**：一键选中当前显示器全屏
+   - **`B`（Brush · 涂鸦标注）**：进入**矢量标注编辑器**
+   - **`P`（Pin · 置顶钉图）**：**Pin 图贴纸**——将选区置顶钉在屏幕上（支持滚轮缩放与快捷关闭）
+   - **`T`（Text · 文本提取）**：**OCR 识字**——原地识别文字并直接写入剪贴板，不弹窗不打断（支持自定义本地/在线引擎）
+   - **`C`（Color · 颜色采样）**：**屏幕取色**——跟随式迷你色卡与像素放大镜，点击即复制 `HEX`
+   - **`Q`（QR Code · 扫码）**：**二维码识别**——冻结画面内自动定位二维码并直达网页链接
+   - **`S`（Save · 保存）**：将当前选区直接保存为 PNG 文件
+   - **`V`（Video · 录屏）**：就地切入**录屏准备态**——自由调节比例与尺寸，`Enter` 开始录制
+
+不用死记硬背复杂的组合键，所想即所按，一切顺着视线自然发生。
+
+![设置页](assets/screenshots/settings.png)
+
+---
+
+## 核心能力
+
+### 1. 疾风般的速度、稳定性与极低资源占用
+- **Rust 原生性能**：无 Electron、无 WebView，基于原生 GPU 渲染管线，托盘常驻内存极低，按下热键毫秒级响应定格。
+- **多屏与 HDR 精确还原**：原生适配多显示器混合 DPI 缩放与 HDR 屏幕色彩映射，4K 画面下依然流畅跟手。
+- **桌面置顶贴图（Pin）**：把参考图、报错截图或设计稿钉在屏幕最前，支持多张并存、滚轮缩放、双击还原原尺寸、右键快捷复制与关闭。
+- **高度可定制的 OCR（本地引擎 + 在线 API）**：支持在设置中自由接入自定义 OCR 引擎——既可外接独立本地引擎（无论是轻量秒速的 RapidOCR + CUDA 加速，还是自装的高精度智能 OCR 引擎都能随习惯配置），按需唤醒、模型复用且空闲 3 分钟自动退出（平时零内存占用）；也支持填写在线 OCR API，兼顾本地极速隐私与云端强力识别。
+- **命令行集成**：支持 `rivix -f`（全屏）、`rivix -r x,y,w,h`（区域）与 `--copy`，方便接入自动化脚本。
+
+### 2. 老牌 FFmpeg 驱动的轻量录屏
+- **硬件加速与高可靠输出**：自动探测 `h264_nvenc` 硬件加速（无 N 卡自动平滑回退 CPU），支持分段防崩溃 MP4 与 GIF 输出，并支持系统音频 / 麦克风混音。
+- **灵活录制框**：进入录屏准备态即可自由调节比例（16:9 / 9:16 等）与预设分辨率，所见即所录。
+
+### 3. 顺手到细节的矢量标注编辑器
+- **工具齐全**：支持选择、矩形（可调圆角）、椭圆、直线、箭头、画笔、荧光笔、马赛克、吸管、橡皮擦、文字（单行点按 / 拖框自动换行段落，支持系统字体下拉选择、独立背景与文字背后圆角描边）。
+- **设计软件级排版与变换**：
+  - 支持 **`Ctrl + A` 全选**、框选多选、**`Alt + 拖动` 快速复制**、**`Delete` / `Backspace` 删除**。
+  - 支持多选 **6 向对齐**（顶 / 左 / 底 / 右 / 水平居中 / 垂直居中，支持 `Alt + W/A/S/D/H/V`）。
+  - 支持 **`Shift + X` 互换填充与描边**（矩形 / 椭圆 / 多边形），直线 / 箭头 / 画笔默认直达描边，马赛克屏蔽颜色干扰。
+  - 支持 **`Ctrl + T` 自由变换与角外旋转**，以及绘制/旋转时的 **`Shift` 角度约束**。
+  - **元素可自由拖出画布之外**，导出时自动按底图范围洁净裁切；完成编辑可一键复制、保存或 **Pin 在屏幕上**。
+
+---
+
+## 快捷键速查
+
+### 全局热键（可在「设置 → 快捷键」自定义）
+
+| 默认热键 | 动作 |
 | --- | --- |
-| ![设置页](assets/screenshots/settings.png) | ![标注编辑](assets/screenshots/viewer.png) |
+| `Insert` | 唤起区域截图（悬停窗口点击即截该窗口） |
+| 默认留空（可自定义） | 全屏截图（推荐通过 `Insert` → `F` 分支调用，也可按习惯绑定） |
+| 默认留空（可自定义） | 屏幕取色（推荐通过 `Insert` → `C` 分支调用，也可按习惯绑定） |
 
-| 区域截图（冻结帧框选 + 尺寸徽标） | 屏幕取色（放大镜 + HEX） |
-| --- | --- |
-| ![区域截图](assets/screenshots/overlay.png) | ![屏幕取色](assets/screenshots/picker.png) |
+### 框选阶段指尖分支（唤起后单键直达）
 
-## 功能特性
-
-- **区域截图**：全屏冻结帧上拖拽框选，实时尺寸徽标，右键 / `Esc` 取消；
-  未拖拽时悬停高亮窗口，点一下即截该窗口（窗口截图并入区域模式，不再单独占一个热键）
-- **全屏截图**：一键截取主显示器并进入统一收尾流程
-- **屏幕取色**：冻结帧 + 放大镜 + 十字线，点击复制 HEX
-- **预览与标注**：缩放 / 平移、矩形、椭圆、箭头、画笔、荧光笔、橡皮擦、马赛克、文字，
-  撤销重做、颜色与线宽可调，底部状态栏给出保存结果
-- **自动保存**：默认存到系统图片库的 `rupix` 子目录，文件名带毫秒时间戳，永不覆盖原图
-- **双格式复制**：文档里粘成图片，资源管理器里粘成文件（Windows）
-- **截图行为开关**：截图后自动复制（默认开）、截图后打开编辑窗（默认关，改在设置 → 截图）；
-  不弹窗时右下角闪一枚提示胶囊，不抢焦点、不会出现在下一张截图里
-- **编辑最近一张**：设置页与托盘各一个入口，补标注不用再走文件对话框
-- **本地图片编辑**：托盘 / 设置页打开任意图片做标注，另存新文件
-- **全局热键**：区域 / 全屏 / 取色三个，失焦可用，设置页可录制
-- **托盘常驻**：启动即隐藏到托盘，左键打开设置，右键出菜单
-- **命令行截图**：`-f` 全屏 / `-r x,y,w,h` 区域，直存 PNG，可 `--copy`
-- **离线 OCR**：PP-OCRv5 mobile（MNN），中英文及多个小语种家族，后台识别不卡界面
-- **开机启动**：Windows 注册表 `Run`、macOS LaunchAgents、Linux XDG autostart，只写当前用户范围
-- **中英双语**：内置中文 / English，可放 `lang-<代码>.txt` 扩展其他语言
-
-## 下载与安装
-
-到 [Releases](https://github.com/launcher-rs/rupix/releases) 下载对应平台的两个包之一：
-
-| 包 | 适合谁 | 内容 |
+| 按键 | 记忆词根 | 动作 |
 | --- | --- | --- |
-| `rupix-<平台>.zip` / `.tar.gz` | 想自己换 OCR 模型 / 在意体积 | 可执行文件 + 外置 `models/`（OCR 开箱即用） |
-| `rupix-<平台>-bundled.zip` / `.tar.gz` | 想要单文件、拷到哪都能跑 | 可执行文件，OCR 模型已打进二进制（约 +21MB） |
+| `Space`（按住） | 抓手平移 | 平移整个选区，松开继续微调大小 |
+| `F` | **F**ullscreen | 一键选中当前显示器全屏 |
+| `B` | **B**rush | 进入矢量标注编辑器 |
+| `P` | **P**in | 置顶贴图钉在屏幕上 |
+| `T` | **T**ext | 原地 OCR 识别文字并写入剪贴板 |
+| `C` | **C**olor | 屏幕取色（点击复制 `HEX`） |
+| `Q` | **Q**R Code | 识别冻结画面中的二维码 |
+| `S` | **S**ave | 直接保存选区为 PNG 文件 |
+| `V` | **V**ideo | 切入录屏准备态（`Enter` 开始录制） |
+| `Esc` / 右键 | — | 取消本次截图并退出 |
 
-- Windows 为 x86_64、使用静态 CRT（免装 MSVC 运行库）；macOS 为 Apple Silicon 构建；
-  Linux 为 x86_64、glibc ≥ 2.35（Ubuntu 22.04+ / Debian 12+ / Fedora 35+）。
-- 绿色便携：解压即用，无需安装器；配置写在 exe 同目录，删掉程序目录即可卸载。
-- 开机启动默认关闭，可在设置 → 通用里打开。
+> **设计师小彩蛋**：如果你平时习惯 **Adobe Illustrator / Figma**，打开标注编辑器后的操作手感和快捷键一定会让你**相见如故**（还藏了一点给客制化键盘与对齐控准备的小惊喜，等你亲自去试）。
 
-> Windows 首次运行时 SmartScreen 可能提示「未知发布者」，这是未做代码签名的小项目常态，
-> 可选择「更多信息 → 仍要运行」，或用源码自行构建。
+<details>
+<summary>展开查看标注编辑器常用快捷键（Adobe 风格直觉操作）</summary>
 
-## 使用
-
-### 全局热键（可在设置 → 快捷键里改）
-
-| 默认按键 | 功能 |
+| 按键 | 动作 |
 | --- | --- |
-| `Ctrl + Shift + A` | 区域截图；悬停高亮窗口时点击即截该窗口 |
-| `Ctrl + Shift + F` | 全屏截图 |
-| `Ctrl + Shift + P` | 屏幕取色 |
+| `V` / `R` / `L` / `O` / `B` / `T` / `M` / `I` / `E` | 选择 / 矩形 / 直线 / 椭圆 / 画笔 / 文字 / 马赛克 / 吸管 / 橡皮擦 |
+| `Ctrl + A` | 全选所有标注元素 |
+| `Ctrl + T` | 自由缩放与角外旋转变换 |
+| `Alt + 拖动` | 原地复制并拖动选中元素 |
+| `Shift + 拖动 / 旋转` | 约束水平 / 垂直 / 45° 方向与角度 |
+| `Shift + X` | 互换填充与描边（矩形 / 椭圆 / 多边形） |
+| `Alt + W/A/S/D/H/V` | 多选 6 向对齐（顶 / 左 / 底 / 右 / 水平居中 / 垂直居中） |
+| `[` / `]` | 步进调节描边粗细 |
+| `Esc` | 编辑文字时：提交内容并切回选择工具；其他状态：取消 / 切回选择 |
+| `Delete` / `Backspace` | 删除选中元素 |
+| `Ctrl + Z` / `Ctrl + Shift + Z` (`Ctrl + Y`) | 撤销 / 重做 |
+| `Ctrl + S` / `Ctrl + V` | 保存结果图 / 从剪贴板打开新图片标注 |
+| `Space`（按住拖动） | 平移画布；`+` / `-` / `0` / 滚轮缩放 |
 
-### 默认流程
+</details>
 
-1. 启动后程序隐藏到系统托盘（双击 exe 不会弹窗，左键单击托盘图标打开设置）；
-2. 按热键截图，区域模式拖拽框选，松手即完成；
-3. 图片自动保存到 **图片库 / rupix**（Windows 为 `%USERPROFILE%\Pictures\rupix`，
-   OneDrive 接管图片库时为 `%OneDrive%\Pictures\rupix`），同时按设置复制到剪贴板；
-4. 默认不弹编辑窗，只在右下角闪一下保存提示。需要标注时：
-   - 在 设置 → 截图 打开「截图后打开编辑窗」，或
-   - 从 托盘 / 设置页 点「编辑最近一张」，或
-   - 直接打开任意图片（托盘 → 打开图片编辑）。
-
-### 设置页
-
-| Tab | 内容 |
-| --- | --- |
-| 截图 | 区域 / 全屏 / 取色入口、编辑最近一张、两个截图行为开关 |
-| 快捷键 | 区域 / 全屏 / 取色热键录制，改完立即生效 |
-| 保存 | 默认保存目录、最近保存记录（可直接打开文件 / 目录） |
-| OCR 模型 | 当前生效模型、三个模型文件的手动指定、下载指引 |
-| 通用 | 界面语言、开机启动 |
-| 关于 | 版本、简介、仓库地址 |
-
-全部设置集中在 exe 旁边的 `rupix-config.json`（纯文本，可直接编辑）。
-
-## 命令行截图
-
-不带参数启动图形界面；带截图参数时不进界面，截完直接退出，可与托盘进程并存，适合脚本调用。
-
-```bash
-rupix -f                              # 全屏截图，保存到默认目录
-rupix -f -o D:\shot.png               # 全屏截图，保存到指定文件
-rupix -r 100,200,800,600 -o a.png     # 区域截图（虚拟屏幕物理像素）
-rupix -f --copy                       # 保存后再把文件复制到剪贴板（Windows）
-rupix --help                          # 查看全部参数
-rupix --version                       # 显示版本
-```
-
-| 参数 | 说明 |
-| --- | --- |
-| `-f` / `--fullscreen` | 截取全屏（多显示器取并集） |
-| `-r` / `--region x,y,w,h` | 截取指定区域，与 `-f` 互斥；部分越界按交集裁剪 |
-| `-o` / `--output 路径` | 输出文件或已存在目录；无扩展名补 `.png`；缺省用默认保存目录 |
-| `--copy` | 保存后把文件复制到剪贴板（Windows） |
-| `-h` / `--help`、`-V` / `--version` | 帮助 / 版本 |
-
-退出码：`0` 成功，`1` 参数错误，`2` 截图 / 保存失败。成功时打印 `已保存：<路径>`。
-命令行截图目前仅 Windows 支持（GDI `BitBlt`），非 Windows 会返回明确错误。
-
-## OCR 文字识别
-
-预览窗点「识别」，后台线程离线推理（单张大图约 0.6 秒，前台不卡）：
-
-- 结果进右侧面板：点行可定位高亮并复制该行，也可一键复制全部；
-- 点「落为标注」把识别行转成文字标注，之后可像普通标注一样移动 / 删除；
-- 低置信度行与单字误检会自动过滤。
-
-模型来源按优先级：
-
-1. 设置 → OCR 模型里手动指定的检测 / 识别 / 字典三个文件（文件名不做匹配）；
-2. `RUPIX_OCR_MODELS` 环境变量指向的目录；
-3. exe 旁的 `models/`（常规发行包自带；开发期由 `build.rs` 从 `assets/ocr-models/` 同步）；
-4. 当前工作目录的 `models/`；调试构建再回退到包根 `assets/ocr-models/`。
-
-默认三件套约 21MB，已随仓库提供。需要换模型或补小语种时，用
-`scripts/download-ocr-models.ps1` 从官方模型库下载；设置页里也有下载地址与复制按钮。
+---
 
 ## 从源码构建
 
 环境要求：
 
-- Rust stable（`edition = "2024"`，建议最新稳定版）；
-- LLVM / libclang（`ocr-rs` 经 bindgen 绑定 MNN，构建时需要）；
-- Windows：MSVC 工具链，`.cargo/config.toml` 已配置静态 CRT；
-- Linux：`libclang-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev
-  libx11-xcb-dev libxcb1-dev libasound2-dev libudev-dev`。
+- Rust stable（`edition = "2024"`）
+- Windows：MSVC 工具链（`.cargo/config.toml` 已配置静态 CRT）
+- Linux：`libclang-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev libxcb1-dev libasound2-dev libudev-dev`
 
 ```bash
-cargo build --release            # 日常使用 / 正式发版（opt-level=3 + thin LTO + strip）
-cargo build --profile size       # 打发布包（opt-level=z + fat LTO，体积最小）
-cargo run --features bundled-ocr-models   # 体验单文件内嵌 OCR 的形态
+cargo build --release            # 正式构建（opt-level=3 + thin LTO + strip）
+cargo build --profile size       # 最小体积构建（opt-level=z + fat LTO）
 ```
 
-说明：
+> 提示：日常使用请运行 `--release` 构建；`debug` 模式下 4K 冻结帧与矢量渲染未做优化，帧率会明显下降。提交代码前请确保 `cargo fmt --check`、`cargo clippy -- -D warnings` 与 `cargo test` 全部通过（详见 [AGENTS.md](AGENTS.md)）。
 
-- **不要用 `cargo run` 日常截图**：debug 构建没有优化，4K 冻结帧的推流、解码、裁剪与烧录
-  会慢一到两个数量级，拖拽和取色都会掉帧；只用它验证逻辑，体验请用 release 构建。
-- 提交前确保 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test` 通过。
-- 在 PowerShell 7 下构建若遇到 ocr-rs 解压失败，换 cmd / Windows PowerShell 5.1，
-  或预置 `%USERPROFILE%\.cargo\registry\src\<镜像>\ocr-rs-<版本>\3rd_party\prebuilt\...` 缓存
-  （详见仓库 Issue 与 `ocr-rs` 构建脚本）。
-- 维护者的 CI 与发版流程见 [docs/RELEASING.md](docs/RELEASING.md)。
+---
 
-## 项目结构
+## 声明与开源协议
 
-```text
-rupix/
-├── assets/                 图标、托盘图标、OCR 默认模型、README 截图
-├── build.rs                Windows exe 图标嵌入 + OCR 模型分发到输出目录
-├── scripts/                OCR 模型下载脚本
-├── docs/                   RELEASING（发版 / CI）、ROADMAP（路线图）
-├── src/
-│   ├── main.rs             程序入口：CLI 早分发、单例、托盘、全局热键
-│   ├── app.rs              设置窗口：截图入口、行为开关、热键、保存、OCR、通用、关于
-│   ├── capture.rs          多显示器逐屏首帧捕获、全屏拼接与截图后统一收尾
-│   ├── overlay.rs          区域选择浮层（多屏各一层，含窗口吸附）
-│   ├── picker.rs           屏幕取色浮层（多屏各一层）
-│   ├── viewer.rs           预览与标注窗口（含 OCR 面板）
-│   ├── export.rs           标注烧录、保存、双格式复制、跨平台字体加载
-│   ├── shapes.rs           矢量标注模型与颜色预设
-│   ├── toast.rs            右下角保存提示胶囊
-│   ├── window.rs           顶层窗口枚举 / 命中（桌面物理坐标，Windows）与自身窗口排除抓屏
-│   ├── hotkey.rs           全局热键注册与持久化
-│   ├── tray.rs             托盘常驻与菜单
-│   ├── cli.rs              命令行截图
-│   ├── ocr.rs              离线 OCR 与模型查找
-│   ├── autostart.rs        开机启动（三平台）
-│   └── i18n.rs             中英双语与外部语言文件
-├── Cargo.toml
-├── CHANGELOG.md
-├── AGENTS.md               协作与代码规范
-└── LICENSE-APACHE
-```
+- **永远免费，开源自由**：本项目采用 [Apache-2.0](LICENSE-APACHE) 协议开源，永不收费、永无广告、永不捆绑。
+- **欢迎交流与建议**：如果你在使用中遇到任何 Bug、有更顺手的交互想法，或希望支持新能力，欢迎提交 **Issue** 或 **Pull Request**。
 
-技术栈：Rust + [rgpui](https://crates.io/crates/rgpui)（UI / 窗口）+
-`image`（编解码 / 裁剪）、`ab_glyph`（文字烧录）、`ocr-rs`（MNN 离线 OCR）。
+---
 
-## 常见问题
+## 请我喝一杯咖啡 ☕
 
-**双击 exe 没反应？**
-程序启动后驻留托盘，不弹主窗口。左键单击托盘图标打开设置；已有实例在跑时再次双击会直接退出
-（单实例守卫，避免热键冲突和重复托盘图标）。
+写代码、抠细节、调色彩、修边界条件，很多灵感都是在深夜的一杯咖啡里攒出来的。  
+如果「望川」刚好也为你省下了一点时间、让每天的截屏和录屏变得更惬意，欢迎请我喝一杯咖啡，支持它继续往前流淌：
 
-**截图存到哪了？**
-默认是图片库下的 `rupix` 子目录，可在 设置 → 保存 修改。每张都是新文件，不会覆盖之前的截图；
-「最近保存」里能直接打开文件或目录。
+<p align="left">
+  <img src="assets/donate-wechat.jpg" width="240" alt="微信赞赏码" />
+</p>
 
-**为什么默认不弹编辑窗？**
-多数截图只需要「截下来 + 粘贴」。默认路径做到最短：自动保存 + 自动复制 + 角落提示。
-需要标注时，在设置里打开「截图后打开编辑窗」，或随时用「编辑最近一张」补。
-
-**OCR 提示找不到模型？**
-常规包里模型在 exe 旁的 `models/`；确认解压完整，或用内嵌版（`-bundled`）。
-也可以从设置 → OCR 模型手动指定三个文件。自行构建时需要 LLVM / libclang。
-
-**支持多显示器吗？**
-支持。区域截图与取色会在每块屏幕上各开一层浮层，可在任意屏幕框选 / 取色；混合 DPI 下按
-「首帧物理尺寸 / 显示器逻辑尺寸」换算，窗口吸附按桌面物理坐标命中，副屏不会错位。
-全屏截图（按钮或 `rupix -f`）把各屏首帧按物理位置拼成并集；命令行 `-r` 的坐标也按
-虚拟屏幕物理像素计算。
-
-**Linux / macOS 能用吗？**
-代码与 CI 覆盖三平台，Windows / Linux 已在真机上验证可用，macOS 尚未完整回归，
-欢迎反馈 Issue / PR。
-
-## 贡献
-
-欢迎 Issue 与 PR。提交代码前请阅读 [AGENTS.md](AGENTS.md)：本项目要求
-**所有新增与修改的 Rust 代码必须有简体中文注释**，并通过 `cargo fmt --check` 与
-`cargo clippy -- -D warnings`。提交信息用中文 `<类型>: <简述>`。
-
-## 许可证
-
-[Apache-2.0](LICENSE-APACHE)。
+感谢每一位同行者。愿你所见皆清晰，所截皆顺心。

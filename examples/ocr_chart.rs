@@ -10,12 +10,12 @@ use image::{Rgb, RgbImage};
 /// 标尺行：文本 + 字号 + 颜色。
 const ROWS: &[(&str, f32, [u8; 3])] = &[
     (
-        "PS C:\\code\\rupix> cargo run --profile size",
+        "PS C:\\code\\rivix> cargo run --profile size",
         20.0,
         [220, 220, 220],
     ),
     (
-        "Compiling rupix v0.1.0 (C:\\code\\rupix)",
+        "Compiling rivix v0.1.0 (C:\\code\\rivix)",
         20.0,
         [220, 220, 220],
     ),
@@ -29,7 +29,7 @@ const ROWS: &[(&str, f32, [u8; 3])] = &[
         20.0,
         [220, 220, 220],
     ),
-    ("拾景 Rupix 截图 OCR 调参标尺", 28.0, [255, 255, 255]),
+    ("望川 Rivix 截图 OCR 调参标尺", 28.0, [255, 255, 255]),
     (
         "托盘图标（正常） 托盘图标（悬停） 托盘图标（激活）",
         20.0,

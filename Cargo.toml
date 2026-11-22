@@ -1,16 +1,20 @@
 [package]
-name = "rupix"
+name = "rivix"
 version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 
+# 固定本地小补丁：Windows 捕获不包含鼠标，避免冻结帧残留指针。
+[patch.crates-io]
+scap-rs = { path = "vendor/scap-rs" }
+
 [dependencies]
 # UI 框架：截图冻结帧推流（screen-capture 特性）与全部窗口能力。
-# 1.7 修复了滚动越界回弹与到边首个滚轮被吞的问题，并新增向导表单 / 差异查看等组件。
-rgpui = { version = "1.7", features = ["screen-capture"] }
+# 1.8 引入 Slug 式路径渲染、深度缓冲 anti-overdraw 与 Windows 局部重绘；1.8.1 修复 async-executor 依赖。
+rgpui = { version = "1.8.1", features = ["screen-capture"] }
 # Linux 图形后端二选一（wayland / x11），缺省两个都不开时运行时直接 unreachable 崩溃；
 # 注意 rgpui 自身的同名特性是空壳，真正的后端开关在 rgpui-linux，经 rgpui-platform 透传才生效。
-rgpui-platform = { version = "1.7", features = [
+rgpui-platform = { version = "1.8.1", features = [
   "screen-capture",
   "wayland",
   "x11",
@@ -31,25 +35,17 @@ image = { version = "0.25", default-features = false, features = [
 ab_glyph = "0.2"
 # 通用错误类型（库逻辑与 example 共用）。
 anyhow = "1"
-# 统一配置文件的序列化（exe 旁单个 `rupix-config.json`）。
+# 二维码本地解码；URL 解析复用依赖树已有版本，防止把非网页协议直接交给系统。
+quircs = "0.10.3"
+url = "2.5"
+# 统一配置文件的序列化（exe 旁单个 `rivix-config.json`）。
 # 两者早已在 rgpui 的依赖树里，不引入额外下载体积。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 离线 OCR：PaddleOCR 系 Rust 实现（MNN 推理），中英文及小语种识别。
-# 默认模型三件套（约 21MB）已进仓库 `assets/ocr-models/`，构建脚本会同步到输出目录旁。
-ocr-rs = "2.4"
-
 [features]
 # 调试面板透传：debug 构建默认启用检查器（F12）；
 # release 下默认剥离，如需保留用 `--features inspector` 显式开启。
 inspector = ["rgpui/inspector"]
-# OCR 模型内嵌：把 PP-OCRv5 mobile 三件套（约 21MB）用 include_bytes! 打进二进制，
-# 运行时零外部文件，开箱即用，适合发版安装包；
-# 默认关闭（外置加载，开发期迭代快、二进制小）。
-# 模型已进仓库（`assets/ocr-models/`），更新版本才需跑 `scripts/download-ocr-models.ps1`。
-# 用法：`cargo run --features bundled-ocr-models`。
-bundled-ocr-models = []
-
 # release 优化：截图工具常驻后台，启动速度与包体积优先。
 # 日常发版用 thin LTO（构建快）；打安装包用下面的 size 档（体积最小）。
 [profile.release]
@@ -81,10 +77,18 @@ windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
   "Win32_System_Console",
   "Win32_System_DataExchange",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Ole",
+  "Win32_System_Pipes",
   "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_WindowsAndMessaging",

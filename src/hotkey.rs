@@ -35,9 +35,8 @@ impl HotkeyKind {
     /// 出厂默认按键串（参考 Snipaste / 微信截图的常用组合）。
     pub fn default_text(self) -> &'static str {
         match self {
-            HotkeyKind::Region => "ctrl-shift-a",
-            HotkeyKind::Full => "ctrl-shift-f",
-            HotkeyKind::Picker => "ctrl-shift-p",
+            HotkeyKind::Region => "insert",
+            HotkeyKind::Full | HotkeyKind::Picker => "",
         }
     }
 
@@ -85,10 +84,14 @@ pub fn load_hotkey_string(kind: HotkeyKind) -> String {
         HotkeyKind::Full => cfg.hotkeys.full,
         HotkeyKind::Picker => cfg.hotkeys.picker,
     };
-    // 顺手校验一次，手改坏的配置不污染本次运行。
+    resolve_hotkey(kind, stored)
+}
+
+/// 空字符串明确表示停用，不能被过滤后恢复成默认快捷键。
+fn resolve_hotkey(kind: HotkeyKind, stored: Option<String>) -> String {
     stored
         .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty() && Keystroke::parse(text).is_ok())
+        .filter(|text| text.is_empty() || Keystroke::parse(text).is_ok())
         .unwrap_or_else(|| kind.default_text().to_string())
 }
 
@@ -116,6 +119,10 @@ pub fn save_hotkey_string(kind: HotkeyKind, hotkey: &str) {
 /// # 返回
 /// 注册成功返回 `Ok(())`；按键串非法或被系统占用时返回中文错误说明。
 pub fn apply_global_hotkey(cx: &mut App, kind: HotkeyKind, hotkey: &str) -> Result<(), String> {
+    if hotkey.trim().is_empty() {
+        cx.unregister_global_hotkey(kind.id());
+        return Ok(());
+    }
     // Windows 的 RegisterHotKey 只支持部分按键（如 F1-F12、单字符、方向键等），
     // 先解析再注册，错误直接展示给用户。
     let keystroke = Keystroke::parse(hotkey).map_err(|error| {
@@ -137,4 +144,21 @@ pub fn apply_global_hotkey(cx: &mut App, kind: HotkeyKind, hotkey: &str) -> Resu
                 ],
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    //! 防止空值被意外注册，或重启后又恢复与其他应用冲突的默认键。
+    use super::*;
+    #[test]
+    fn blank_means_disabled() {
+        assert_eq!(resolve_hotkey(HotkeyKind::Region, None), "insert");
+        assert_eq!(resolve_hotkey(HotkeyKind::Full, None), "");
+        assert_eq!(resolve_hotkey(HotkeyKind::Picker, None), "");
+        assert_eq!(resolve_hotkey(HotkeyKind::Region, Some("  ".into())), "");
+        assert_eq!(
+            resolve_hotkey(HotkeyKind::Full, Some("ctrl-alt-f".into())),
+            "ctrl-alt-f"
+        );
+    }
 }

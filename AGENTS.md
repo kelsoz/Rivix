@@ -1,11 +1,11 @@
-# AGENTS.md — Rupix · 拾景 AI 协作规范
+# AGENTS.md — Rivix · 望川 AI 协作规范
 
 本文件面向所有参与本项目的人类与 AI 协作者（Codex / Muse / opencode 等）。
 凡修改本仓库代码，必须遵守以下规范。
 
 ## 1. 项目简介
 
-- 项目名：**Rupix（拾景）**
+- 项目名：**Rivix（望川）**
 - 定位：基于 **Rust + rgpui** 的轻量级跨平台截图工具。
 - 理念：**看到 → 截取 → 留存**，从屏幕中拾取所见之景。
 - 技术栈：`rgpui`（UI 渲染与交互）+ `rgpui-platform`（跨平台窗口 / 事件）。
@@ -13,7 +13,7 @@
 
 ## 2. 构建 / 检查命令
 
-所有命令均在 `rupix/` 目录下执行：
+所有命令均在 `rivix/` 目录下执行：
 
 ```bash
 cargo run              # 本地运行
@@ -29,10 +29,14 @@ cargo test             # 运行测试（如有）
 ## 3. 代码风格
 
 - 使用 `cargo fmt` 默认风格，4 空格缩进。
-- 文件 / 模块按功能划分：`config.rs`（统一配置：exe 旁单个 `rupix-config.json`）/ `capture.rs`（多显示器逐屏首帧捕获、全屏拼接 + 截图后统一收尾）/ `overlay.rs`（区域选择浮层，多屏各一层、含窗口吸附）/ `viewer.rs`（预览标注）/ `export.rs`（烧录保存复制，跨平台系统字体加载）/ `shapes.rs`（矢量标注模型与颜色预设）/ `picker.rs`（屏幕取色，多屏各一层）/ `toast.rs`（截图保存提示：右下角胶囊，1.6 秒自动消失、不抢焦点、排除出抓屏）/ `window.rs`（顶层窗口枚举 / 命中，Windows，桌面物理坐标；其他平台空实现；另含自身窗口排除抓屏）/ `hotkey.rs`（快捷键）/ `tray.rs`（托盘：截图 / 编辑最近一张 / 打开图片编辑 / 设置 / 退出）/ `app.rs`（设置窗口：截图入口（含编辑最近一张）/ 截图行为开关（截图后自动复制到剪贴板、截图后打开编辑窗，持久化在统一配置）/ 快捷键 / 保存 / OCR 模型 / 通用（语言、开机启动）/ 关于）/ `cli.rs`（命令行截图：全屏 / 区域直存 PNG）/ `i18n.rs`（界面语言：中英内置，外部语言文件扩展）/ `ocr.rs`（离线 OCR：内嵌/默认目录/手动三文件三处来源，后台识别底图并落成文字标注）/ `autostart.rs`（开机启动：Windows 注册表 Run / macOS LaunchAgents / Linux XDG autostart）。新增模块同步更新此行。
+- 文件 / 模块按功能划分：`config.rs`（统一配置：exe 旁单个 `rivix-config.json`）/ `capture.rs`（多显示器逐屏首帧捕获、全屏拼接 + 截图后统一收尾）/ `overlay.rs`（区域选择浮层，多屏各一层、含窗口吸附）/ `viewer.rs`（预览标注）/ `export.rs`（烧录保存复制，跨平台系统字体加载）/ `shapes.rs`（矢量标注模型与颜色预设）/ `picker.rs`（屏幕取色及共享原生迷你色卡，多屏各一层）/ `pin.rs`（圆角置顶贴图、拖动缩放、系统右键菜单，无静止刷新）/ `toast.rs`（底部居中胶囊，1.8 秒升降淡入淡出、不抢焦点、排除出抓屏）/ `window.rs`（顶层窗口枚举 / 命中，Windows，桌面物理坐标；其他平台空实现；另含自身窗口排除抓屏）/ `hotkey.rs`（快捷键）/ `tray.rs`（托盘：截图 / 编辑最近一张 / 打开图片编辑 / 设置 / 退出）/ `app.rs`（设置窗口：截图入口（含编辑最近一张）/ 截图行为开关（截图后自动复制到剪贴板、截图后打开编辑窗，持久化在统一配置）/ 快捷键 / 保存 / OCR 模型 / 通用（语言、开机启动）/ 关于）/ `cli.rs`（命令行截图：全屏 / 区域直存 PNG）/ `i18n.rs`（界面语言：中英内置，外部语言文件扩展）/ `ocr.rs`（独立 RapidOCR 3.10 CUDA：外部 worker、原始像素管道、模型按需复用、空闲 180 秒退出，文本直接复制）/ `record.rs`（轻量级屏幕录制：按比例/预设尺寸微调、MP4 Media Foundation + WASAPI 混音、GIF 编码、悬浮红框与控制条）/ `autostart.rs`（开机启动：Windows 注册表 Run / macOS LaunchAgents / Linux XDG autostart）/ `feedback.rs`（内嵌快门声，操作完成后异步反馈）。新增模块同步更新此行。
 - 公开 API 必须有文档注释，内部复杂逻辑必须有行内注释。
 - 错误处理优先返回 `anyhow::Result` / `std::io::Result` 或自定义错误枚举，禁止在库逻辑中直接 `unwrap()` / `expect()`（示例与测试代码除外）。
 - UI 文案默认中文，预留英文国际化接口。
+
+二维码模块：`qr.rs` 负责冻结画面一次性后台解码、物理选区命中和 HTTP/HTTPS 地址校验；指示点仅由 `overlay.rs` 绘制，不进入原图。
+
+依赖补丁模块：`vendor/scap-rs/src/capturer/engine/win/hdr.rs` 负责 HDR 半精度像素按每屏 SDR 白电平转换为 sRGB；同目录 `mod.rs` 查询显示配置并选择捕获格式。测试直接复用该转换模块。
 
 ## 4. 中文注释规范（强制）
 
@@ -77,7 +81,7 @@ pub fn enter_region_capture(cx: &mut Context<AppState>) {
 ## 5. 提交规范
 
 - 提交信息使用中文简述，格式：`<类型>: <简述>`，类型可选 `feat / fix / docs / refactor / chore`。
-- 示例：`feat: 实现区域截图选区拖拽`、`docs: 补充拾景命名说明`。
+- 示例：`feat: 实现区域截图选区拖拽`、`docs: 补充望川命名说明`。
 - 一次提交只做一件事，保持 diff 最小化。
 
 ## 6. AI 协作注意事项

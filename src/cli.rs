@@ -9,17 +9,17 @@ use std::path::{Path, PathBuf};
 use image::RgbaImage;
 
 /// 命令行帮助文案（`--help` 与参数错误时展示）。
-const HELP: &str = "Rupix 拾景 · 命令行截图\n\
+const HELP: &str = "Rivix 望川 · 命令行截图\n\
     \n\
     用法：\n\
-    \x20 rupix                              启动图形界面（托盘常驻）\n\
-    \x20 rupix -f [--output 路径] [--copy]             截取全屏\n\
-    \x20 rupix -r x,y,w,h [--output 路径] [--copy]     截取指定区域\n\
-    \x20 rupix -h | --help                  显示本帮助\n\
-    \x20 rupix -V | --version               显示版本\n\
+    \x20 rivix                              启动图形界面（托盘常驻）\n\
+    \x20 rivix -f [--output 路径] [--copy]             截取全屏\n\
+    \x20 rivix -r x,y,w,h [--output 路径] [--copy]     截取指定区域\n\
+    \x20 rivix -h | --help                  显示本帮助\n\
+    \x20 rivix -V | --version               显示版本\n\
     \n\
     说明：\n\
-    \x20 - 未指定 --output 时，保存到与图形界面共用的默认目录，文件名 rupix-<毫秒>.png。\n\
+    \x20 - 未指定 --output 时，保存到与图形界面共用的默认目录，文件名 rivix-<毫秒>.png。\n\
     \x20 - --output 可为文件或已存在的目录（目录则自动补文件名）；无扩展名时补 .png。\n\
     \x20 - 坐标为虚拟屏幕物理像素（多显示器取并集），如 100,200,800,600。\n\
     \x20 - --copy 把保存的文件再复制到剪贴板（Windows）。\n";
@@ -74,7 +74,7 @@ pub fn run_cli() -> i32 {
             0
         }
         Ok(CliAction::Version) => {
-            println!("rupix {}", env!("CARGO_PKG_VERSION"));
+            println!("rivix {}", env!("CARGO_PKG_VERSION"));
             0
         }
         Ok(CliAction::Capture(request)) => match execute_capture(&request) {

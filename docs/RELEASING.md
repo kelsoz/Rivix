@@ -1,6 +1,6 @@
 # 发版与持续集成
 
-本文面向维护者，说明 Rupix 的本地检查、CI 与 GitHub Release 流程。
+本文面向维护者，说明 Rivix 的本地检查、CI 与 GitHub Release 流程。
 用户安装 / 使用说明见仓库根目录的 [README](../README.md)。
 
 ## 1. 本地检查（提交前）
@@ -46,7 +46,7 @@ git push origin v0.3.0
 
 - Release 名与 tag 同名，**不碰 `latest`**，编译档固定 `size`；
 - prepare 阶段校验 tag 与 `Cargo.toml` 的 `version` 一致，不一致直接失败——
-  防止发出「标签写 0.3.0、`rupix --version` 却打 0.2.0」的误标包；
+  防止发出「标签写 0.3.0、`rivix --version` 却打 0.2.0」的误标包；
   改版本号后记得让 `Cargo.lock` 一起更新（构建时会自动同步）；
 - 重复推同一 tag 只覆盖本平台附件，不会删已有 Release。
 
@@ -72,8 +72,8 @@ Windows 必须编过；Linux / macOS 为尽力而为（本机无对应设备完�
 
 | 包 | 内容 |
 | --- | --- |
-| 常规版 `rupix-<平台>.zip` / `.tar.gz` | exe + 外置 `models/`（OCR 开箱即用），解压即用 |
-| 内嵌版 `rupix-<平台>-bundled.zip` / `.tar.gz` | `--features bundled-ocr-models`，模型打进二进制，单文件开箱即用（体积约 +21MB） |
+| 常规版 `rivix-<平台>.zip` / `.tar.gz` | exe + 外置 `models/`（OCR 开箱即用），解压即用 |
+| 内嵌版 `rivix-<平台>-bundled.zip` / `.tar.gz` | `--features bundled-ocr-models`，模型打进二进制，单文件开箱即用（体积约 +21MB） |
 
 - 常规包的 `models/` 由 `build.rs` 从 `assets/ocr-models/` 自动分发；缺失时只出内嵌包并告警；
 - Windows 使用静态 CRT，免装 MSVC 运行库；Linux 基线 glibc ≥ 2.35
@@ -86,5 +86,5 @@ Windows 必须编过；Linux / macOS 为尽力而为（本机无对应设备完�
 3. UI 有变化时更新 `assets/screenshots/` 与 README 截图；
 4. 推送 `main`，等 CI 全绿；
 5. 打与版本号一致的 tag 并推送；
-6. 下载各平台产物做一次冒烟：`rupix --version`、`--help`、截图 / 取色 / OCR 各一次；
+6. 下载各平台产物做一次冒烟：`rivix --version`、`--help`、截图 / 取色 / OCR 各一次；
 7. 检查 Release 说明中的平台限制与开机启动行为（默认关闭）是否仍准确。

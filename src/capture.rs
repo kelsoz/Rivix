@@ -1,13 +1,17 @@
-//! 截图捕获模块：从系统屏幕源截取首帧，落地为临时图片后打开标注浮层。
+//! 截图捕获模块：从系统屏幕源取得内存首帧，直接打开冻结浮层。
 //!
 //! rgpui 的屏幕捕获只有持续推流接口（`stream`），没有单帧 API，
-//! 因此“截取一张图”实现为：启动推流 → 取第一帧的 RGBA → 存盘 → 停止推流。
+//! 因此“截取一张图”实现为：启动推流 → 事件通知传递首帧 RGBA → 停止推流。
 //!
 //! 多显示器：每块屏各取一帧，并记下与 rgpui 显示器 ID 的对应关系。
 //! 区域截图 / 取色按「一块屏一个浮层」打开，全屏截图按物理坐标拼成虚拟桌面并集。
 
+// 直接覆盖依赖中的生产转换实现，避免为测试维护第二套 HDR 算法。
+#[cfg(test)]
+#[path = "../vendor/scap-rs/src/capturer/engine/win/hdr.rs"]
+mod hdr_conversion;
+
 use std::{
-    path::PathBuf,
     rc::Rc,
     sync::{
         Arc,
@@ -21,15 +25,15 @@ use rgpui::{
 };
 
 use crate::{
-    app::{PreviewImage, RupixApp, finish_capture},
+    app::{RivixApp, finish_capture, prepare_capture},
     i18n::{tr, tr_fmt},
     overlay::open_overlays,
 };
 
 /// 单块显示器上的首帧捕获结果（区域截图 / 取色 / 全屏共用）。
 pub struct CapturedFrame {
-    /// 首帧落盘的临时图片路径（裁剪与采样的像素来源）。
-    pub frame_path: PathBuf,
+    /// 首帧原始像素（裁剪与采样共享，不重复解码）。
+    pub pixels: Arc<image::RgbaImage>,
     /// 全图宽度（图片物理像素）。
     pub img_w: u32,
     /// 全图高度（图片物理像素）。
@@ -38,8 +42,8 @@ pub struct CapturedFrame {
     pub display_bounds: Bounds<Pixels>,
     /// 对应 rgpui 显示器 ID（无显示器信息时为 None）。
     pub display_id: Option<DisplayId>,
-    /// 预解码的首帧（同步图片源用；None 时回退路径异步加载）。
-    pub frame_image: Option<Arc<RenderImage>>,
+    /// 可直接显示的首帧（BGRA）。
+    pub frame_image: Arc<RenderImage>,
 }
 
 /// 显示器与系统捕获源的配对结果（异步阶段逐屏取首帧用）。
@@ -69,9 +73,9 @@ enum CaptureFailure {
 /// - `cx`: 主视图上下文。
 /// - `fullscreen`: 为 true 时浮层打开即选中全图，跳过手动选区。
 pub fn begin_capture(
-    state: &mut RupixApp,
+    state: &mut RivixApp,
     window: &mut Window,
-    cx: &mut Context<RupixApp>,
+    cx: &mut Context<RivixApp>,
     fullscreen: bool,
 ) {
     // 同一时间只允许一轮截取，避免重复推流占用系统捕获会话。
@@ -95,41 +99,44 @@ pub fn begin_capture(
         let Some(frames) = capture_displays(&this, cx, displays, primary_id).await else {
             return;
         };
-        // 在 UI 上下文恢复主视图状态，并按模式分流。
-        // 注意：此处已在实体的单次租借内，直接改 `state`，不要再嵌套 `update`。
-        let updated = this
-            .update(cx, |state, cx| {
-                if fullscreen {
-                    // 全屏截图：多屏按物理坐标拼成并集，再统一收尾。
-                    state.capturing = false;
-                    match compose_desktop(&frames) {
-                        Ok(preview) => {
-                            let (_, auto_note) = finish_capture(state, cx, &preview);
-                            let msg = tr_fmt(
+        if fullscreen {
+            let result =
+                cx.background_executor()
+                    .spawn(async move {
+                        compose_desktop(&frames).and_then(|image| prepare_capture(&image))
+                    })
+                    .await;
+            let _ = this.update(cx, |state, cx| {
+                state.capturing = false;
+                match result {
+                    Ok(capture) => {
+                        let (preview, note) = finish_capture(state, cx, capture);
+                        state.set_status(
+                            &tr_fmt(
                                 "cap.full_done",
                                 &[
                                     ("w", &preview.w.to_string()),
                                     ("h", &preview.h.to_string()),
-                                    ("note", &auto_note),
+                                    ("note", &note),
                                 ],
-                            );
-                            state.set_status(&msg, cx);
-                        }
-                        Err(error) => {
-                            let msg = tr_fmt("cap.full_fail", &[("error", &error)]);
-                            state.set_status(&msg, cx);
-                        }
+                            ),
+                            cx,
+                        );
                     }
-                } else {
-                    // 区域截图：每块屏各开一层遮罩浮层，可在任意屏幕上框选。
-                    // 浮层打开期间保持 capturing = true，阻止热键再次触发导致浮层叠加；
-                    // 完成 / 取消时由浮层复位（见 overlay::finish / cancel）。
-                    state.set_status(&tr("cap.region_hint"), cx);
-                    if !open_overlays(cx.entity(), cx, frames) {
-                        // 浮层没打开就没有人来复位状态，这里补上，避免后续截图全被挡住。
-                        state.capturing = false;
-                        state.set_status(&tr("cap.overlay_fail"), cx);
+                    Err(error) => {
+                        state.set_status(&tr_fmt("cap.full_fail", &[("error", &error)]), cx)
                     }
+                }
+            });
+            return;
+        }
+        // 内存首帧直接交给浮层，进入框选前不再编码或读写 PNG。
+        let updated = this
+            .update(cx, |state, cx| {
+                state.set_status(&tr("cap.region_hint"), cx);
+                if !open_overlays(cx.entity(), cx, frames) {
+                    state.capturing = false;
+                    state.set_status(&tr("cap.overlay_fail"), cx);
                 }
             })
             .is_ok();
@@ -144,7 +151,7 @@ pub fn begin_capture(
 /// - `state`: 主视图可变引用（调用方已持有实体租借，直接改状态，不要再 `update`）。
 /// - `window`: 发起取色的窗口，用于挂载后台任务。
 /// - `cx`: 主视图上下文。
-pub fn begin_picker(state: &mut RupixApp, window: &mut Window, cx: &mut Context<RupixApp>) {
+pub fn begin_picker(state: &mut RivixApp, window: &mut Window, cx: &mut Context<RivixApp>) {
     // 同一时间只允许一轮操作，避免重复推流占用系统捕获会话。
     if state.capturing {
         return;
@@ -190,12 +197,12 @@ fn display_targets(cx: &rgpui::App) -> Vec<(Option<DisplayId>, Bounds<Pixels>)> 
         .collect()
 }
 
-/// 逐屏捕获首帧并落盘（区域 / 全屏 / 取色共享）。
+/// 逐屏捕获内存首帧（区域 / 全屏 / 取色共享）。
 ///
 /// 失败时内部已复位状态机并写清中文状态，返回 `None`；
 /// 成功返回每块屏一帧的数据，调用方负责后续分流（浮层 / 拼接 / 取色）。
 async fn capture_displays(
-    this: &WeakEntity<RupixApp>,
+    this: &WeakEntity<RivixApp>,
     cx: &mut AsyncWindowContext,
     displays: Vec<(Option<DisplayId>, Bounds<Pixels>)>,
     primary_id: Option<DisplayId>,
@@ -283,65 +290,38 @@ async fn capture_target(
     index: usize,
     cx: &mut AsyncWindowContext,
 ) -> Result<CapturedFrame, CaptureFailure> {
-    // 首帧落盘路径：系统临时目录 + 时间戳 + 屏序号，避免多轮 / 多屏互相覆盖。
-    let frame_path = std::env::temp_dir().join(format!("rupix-frame-{}-{index}.png", temp_stamp()));
-    let frame_saved = Arc::new(AtomicBool::new(false));
-
-    // 推流回调跑在捕获线程，只能做 Send 操作：转 RGBA 并写文件。
-    let callback_path = frame_path.clone();
-    let callback_flag = frame_saved.clone();
-    let frame_callback: Box<dyn Fn(rgpui::ScreenCaptureFrame) + Send> = Box::new(move |frame| {
-        // 只要第一帧，后续帧直接丢弃，节省 IO。
-        if callback_flag.load(Ordering::Relaxed) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let received = Arc::new(AtomicBool::new(false));
+    let flag = received.clone();
+    let callback = Box::new(move |frame: rgpui::ScreenCaptureFrame| {
+        if flag.load(Ordering::Relaxed) {
             return;
         }
         if let Some(rgba) = frame.to_rgba() {
-            // 宽高留给浮层做缩放显示与裁剪换算。
-            let (width, height) = (rgba.width(), rgba.height());
-            if rgba.save(&callback_path).is_ok() {
-                // 把尺寸编码进伴随文件，避免跨线程再传一次图片。
-                let _ = std::fs::write(
-                    callback_path.with_extension("size"),
-                    format!("{width}x{height}"),
-                );
-                callback_flag.store(true, Ordering::Relaxed);
+            if flag.swap(true, Ordering::Relaxed) {
+                return;
             }
+            let render = render_frame(&rgba);
+            let _ = tx.try_send((rgba, render));
         }
     });
-
-    // 推流必须在前台执行器上发起（rgpui 约束）。
     let foreground = cx.foreground_executor().clone();
-    let stream_rx = target.source.stream(&foreground, frame_callback);
-
-    // 等待推流真正启动，失败则直接返回。
-    let stream = match stream_rx.await {
+    let stream = match target.source.stream(&foreground, callback).await {
         Ok(Ok(stream)) => stream,
         _ => return Err(CaptureFailure::StreamStart),
     };
-
-    // 最多等待 5 秒首帧；超时一般是目标屏幕静止无帧或权限不足。
-    let mut waited = 0;
-    while !frame_saved.load(Ordering::Relaxed) && waited < 100 {
-        cx.background_executor()
-            .timer(std::time::Duration::from_millis(50))
-            .await;
-        waited += 1;
-    }
-    // 显式释放推流，会话随之关闭（首帧已落盘，无需继续）。
+    // 等待真实首帧通知，消除原来 50ms 轮询的额外等待，同时保留五秒超时。
+    let result = cx
+        .background_executor()
+        .spawn(async move { rx.recv_timeout(std::time::Duration::from_secs(5)) })
+        .await;
     drop(stream);
-
-    if !frame_saved.load(Ordering::Relaxed) {
-        return Err(CaptureFailure::Timeout);
-    }
-
-    // 从伴随的 .size 文件读回图片尺寸。
-    let (img_w, img_h) = read_frame_size(&frame_path).unwrap_or((0, 0));
-    // 首帧提前解码为 RenderImage（耗时挪到“正在截取”阶段），浮层首帧立现。
-    let frame_image = decode_frame_image(&frame_path);
+    let (rgba, frame_image) = result.map_err(|_| CaptureFailure::Timeout)?;
+    cap_log(&format!("屏 {index} 内存首帧就绪"));
     Ok(CapturedFrame {
-        frame_path,
-        img_w,
-        img_h,
+        img_w: rgba.width(),
+        img_h: rgba.height(),
+        pixels: Arc::new(rgba),
         display_bounds: target.display_bounds,
         display_id: target.display_id,
         frame_image,
@@ -436,7 +416,7 @@ fn pair_targets(
 ///
 /// Windows 的 scap 源 ID 是 `HMONITOR` 截断到 u32，而 rgpui 保留完整 u64；
 /// 句柄值超出 32 位时按低 32 位比较，否则副屏会永远匹配不上。
-fn source_matches_display(meta: &Option<SourceMetadata>, display_id: DisplayId) -> bool {
+pub(crate) fn source_matches_display(meta: &Option<SourceMetadata>, display_id: DisplayId) -> bool {
     let Some(meta) = meta else { return false };
     let raw: u64 = display_id.into();
     raw == meta.id || (raw > u32::MAX as u64 && raw as u32 == meta.id as u32)
@@ -453,15 +433,10 @@ impl CaptureFailure {
 }
 
 /// 全屏截图：单屏直接复用首帧，多屏按物理坐标拼成虚拟桌面并集图。
-fn compose_desktop(frames: &[CapturedFrame]) -> Result<PreviewImage, String> {
+fn compose_desktop(frames: &[CapturedFrame]) -> Result<image::RgbaImage, String> {
     if let [frame] = frames {
-        return Ok(PreviewImage {
-            path: frame.frame_path.clone(),
-            w: frame.img_w,
-            h: frame.img_h,
-        });
+        return Ok((*frame.pixels).clone());
     }
-
     // 显示器逻辑边界 × 该屏缩放比（由帧宽与逻辑宽反推）得到物理原点，
     // 混合 DPI 下也能把各屏摆回虚拟桌面的真实位置。
     let rects: Vec<(i64, i64)> = frames
@@ -492,36 +467,17 @@ fn compose_desktop(frames: &[CapturedFrame]) -> Result<PreviewImage, String> {
 
     let mut canvas = image::RgbaImage::new(out_w, out_h);
     for (frame, (x, y)) in frames.iter().zip(rects) {
-        let img = image::open(&frame.frame_path)
-            .map_err(|error| format!("读取首帧失败：{error}"))?
-            .into_rgba8();
         // 各屏帧都是物理像素，直接按物理坐标叠放，缩放差异已体现在帧尺寸里。
-        image::imageops::overlay(&mut canvas, &img, x - min_x, y - min_y);
+        image::imageops::overlay(&mut canvas, &*frame.pixels, x - min_x, y - min_y);
     }
 
-    let dst = std::env::temp_dir().join(format!("rupix-full-{}.png", temp_stamp()));
-    canvas
-        .save(&dst)
-        .map_err(|error| format!("保存全屏合成图失败：{error}"))?;
-    Ok(PreviewImage {
-        path: dst,
-        w: out_w,
-        h: out_h,
-    })
-}
-
-/// 毫秒时间戳（临时文件名用）。
-fn temp_stamp() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
+    Ok(canvas)
 }
 
 /// 截图诊断日志：追加到系统临时目录，便于复现卡死时取证。
 pub(crate) fn cap_log(msg: &str) {
     // 日志写失败不影响截图流程，直接忽略。
-    let path = std::env::temp_dir().join("rupix-cap.log");
+    let path = std::env::temp_dir().join("rivix-cap.log");
     let line = format!(
         "[pid={} {}] {msg}\n",
         std::process::id(),
@@ -556,29 +512,23 @@ fn sources_result_desc(
     }
 }
 
-/// 把首帧 PNG 解码为可直接渲染的 `RenderImage`（与 rgpui 内置 img 解码一致）。
-///
-/// 开窗前在后台做掉：解码耗时（debug 下约半秒）发生在“正在截取”阶段，
-/// 浮层首帧即可呈现冻结图，不会出现先透活屏、半秒后才变灰的闪烁。
-/// 解码失败返回 None，调用方回退到路径异步加载。
-fn decode_frame_image(frame_path: &std::path::Path) -> Option<Arc<rgpui::RenderImage>> {
-    // 读盘失败或格式非法都按 None 处理，不阻断截图流程。
-    let bytes = std::fs::read(frame_path).ok()?;
-    let mut rgba = image::load_from_memory(&bytes).ok()?.into_rgba8();
-    // 与 rgpui img 解码一致：RGBA 转 BGRA。
-    let (chunks, _) = rgba.as_chunks_mut::<4>();
-    for pixel in chunks {
+/// 直接从原始 RGBA 生成渲染用 BGRA，避免 PNG 编码与解码往返。
+fn render_frame(rgba: &image::RgbaImage) -> Arc<rgpui::RenderImage> {
+    let mut pixels = rgba.clone();
+    for pixel in pixels.as_flat_samples_mut().samples.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
-    // Vec<Frame> 经 From 直接转 SmallVec，不引入新依赖。
-    Some(Arc::new(rgpui::RenderImage::new(vec![image::Frame::new(
-        rgba,
-    )])))
+    Arc::new(rgpui::RenderImage::new(vec![image::Frame::new(pixels)]))
 }
 
-/// 读取首帧伴随的尺寸文件（`宽x高` 文本）。
-fn read_frame_size(frame_path: &std::path::Path) -> Option<(u32, u32)> {
-    let text = std::fs::read_to_string(frame_path.with_extension("size")).ok()?;
-    let (w, h) = text.trim().split_once('x')?;
-    Some((w.parse().ok()?, h.parse().ok()?))
+#[cfg(test)]
+mod frame_tests {
+    //! 内存首帧保持原图不变，显示缓冲区正确交换通道。
+    use super::*;
+    #[test]
+    fn render_does_not_mutate_source() {
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([10, 20, 30, 255]));
+        let _ = render_frame(&image);
+        assert_eq!(image.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
 }
