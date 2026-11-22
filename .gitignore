@@ -9,5 +9,6 @@ HDR排查报告.md
 PERFORMANCE.md
 docs/MAINTENANCE.md
 assets/*.ai
+AGENTS.md
 # OCR 模型已进仓库（assets/ocr-models，约 21MB），新 clone 开箱即用；
 # `scripts/download-ocr-models.ps1` 仅用于更新模型版本。

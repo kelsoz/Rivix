@@ -144,7 +144,7 @@ cargo build --release            # 正式构建（opt-level=3 + thin LTO + strip
 cargo build --profile size       # 最小体积构建（opt-level=z + fat LTO）
 ```
 
-> 提示：日常使用请运行 `--release` 构建；`debug` 模式下 4K 冻结帧与矢量渲染未做优化，帧率会明显下降。提交代码前请确保 `cargo fmt --check`、`cargo clippy -- -D warnings` 与 `cargo test` 全部通过（详见 [AGENTS.md](AGENTS.md)）。
+> 提示：日常使用请运行 `--release` 构建；`debug` 模式下 4K 冻结帧与矢量渲染未做优化，帧率会明显下降。提交代码前请确保 `cargo fmt --check`、`cargo clippy -- -D warnings` 与 `cargo test` 全部通过。
 
 ---
 
@@ -165,3 +165,5 @@ cargo build --profile size       # 最小体积构建（opt-level=z + fat LTO）
 </p>
 
 感谢每一位同行者。愿你所见皆清晰，所截皆顺心。
+
+<sub>注：本项目由个人主导设计与审美打磨，开发过程中与 AI 深度协作完成。</sub>
