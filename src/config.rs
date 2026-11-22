@@ -196,17 +196,11 @@ pub fn config_path() -> PathBuf {
     config_dir().join(CONFIG_FILE)
 }
 
-/// 读取磁盘配置：新配置不存在时平滑兼容旧版 `rupix-config.json`，缺失或损坏则返回默认值。
+/// 读取磁盘配置：缺失返回默认值，损坏时备份原文件后回退默认值。
 fn load_from_disk() -> AppConfig {
     let path = config_path();
     if path.is_file() {
         return load_or_recover(&path);
-    }
-    let legacy = path.with_file_name("rupix-config.json");
-    if legacy.is_file() {
-        let cfg = load_or_recover(&legacy);
-        let _ = write_config(&path, &cfg);
-        return cfg;
     }
     AppConfig::default()
 }
