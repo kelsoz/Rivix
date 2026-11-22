@@ -30,10 +30,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 静态检查：格式 + lint。放在 Linux 单跑，最快拿到“能不能合”的结论。
+  # 静态检查：格式 + lint（Windows 主力平台）。
   lint:
     name: fmt + clippy
-    runs-on: ubuntu-22.04
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -44,24 +44,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # clippy 要完整编译一遍，系统依赖与构建一致；Linux 故意钉 22.04（glibc 基线只升不降）。
-      - name: 安装系统依赖（Linux）
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libclang-dev \
-            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libasound2-dev libudev-dev
-
       - name: 格式检查（cargo fmt --check）
-        shell: bash
+        shell: pwsh
         run: cargo fmt --check
 
       - name: 静态检查（cargo clippy -- -D warnings）
-        shell: bash
+        shell: pwsh
         run: cargo clippy -- -D warnings
 
-  # 构建 + 冒烟 + 单测：三平台并行，谁都不等谁；Linux/macOS 只是编译验证，基线信息随日志给出。
+  # 构建 + 冒烟 + 单测（仅保留 Windows 主力平台）。
   build:
     name: build (${{ matrix.name }})
     needs: lint
@@ -72,10 +63,6 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x86_64
-          - os: ubuntu-22.04
-            name: linux-x86_64
-          - os: macos-latest
-            name: macos-aarch64
     steps:
       - uses: actions/checkout@v4
 

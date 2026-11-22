@@ -78,13 +78,11 @@ jobs:
           fi
 
           win='{"id":"windows","os":"windows-latest","name":"windows-x86_64","best-effort":false}'
-          lin='{"id":"linux","os":"ubuntu-22.04","name":"linux-x86_64","best-effort":true}'
           mac='{"id":"macos","os":"macos-latest","name":"macos-aarch64","best-effort":true}'
           case "$INPUT_PLATFORM" in
             windows) m="[$win]" ;;
-            linux) m="[$lin]" ;;
             macos) m="[$mac]" ;;
-            *) m="[$win,$lin,$mac]" ;;
+            *) m="[$win,$mac]" ;;
           esac
 
           {
