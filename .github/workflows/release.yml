@@ -78,12 +78,7 @@ jobs:
           fi
 
           win='{"id":"windows","os":"windows-latest","name":"windows-x86_64","best-effort":false}'
-          mac='{"id":"macos","os":"macos-latest","name":"macos-aarch64","best-effort":true}'
-          case "$INPUT_PLATFORM" in
-            windows) m="[$win]" ;;
-            macos) m="[$mac]" ;;
-            *) m="[$win,$mac]" ;;
-          esac
+          m="[$win]"
 
           {
             echo "matrix=$m"
