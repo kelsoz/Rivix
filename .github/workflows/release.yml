@@ -105,7 +105,7 @@ jobs:
             # 正式版本：git tag 已由 push 事件存在，这里只补上同名的 release。
             # 重复推同一个 tag（改代码后强制重打）时只补缺失的 release，不删已有附件、不碰 latest。
             if ! gh release view "$TAG" >/dev/null 2>&1; then
-              gh release create "$TAG" --title "Rivix 望川 $TAG" --notes "版本发布 $TAG：Windows 单文件绿色版（rivix.exe 解压即用，录屏按需搭配 ffmpeg.exe），另附 Linux / macOS 构建产物。Windows 静态 CRT 免装运行库；Linux 基线 glibc ≥ 2.35。"
+              gh release create "$TAG" --title "Rivix 望川 $TAG" --notes "版本发布 $TAG：Windows 绿色开箱版（含 rivix.exe 与录屏用 ffmpeg.exe 及 ffmpeg-LICENSE.txt，解压即用），另附 Linux / macOS 构建产物。Windows 静态 CRT 免装运行库；Linux 基线 glibc ≥ 2.35。"
             fi
             exit 0
           fi
@@ -199,8 +199,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path 'dist', 'stage-regular' | Out-Null
+          New-Item -ItemType Directory -Force -Path 'dist', 'stage-regular', 'ffmpeg-dl' | Out-Null
           Copy-Item -Path 'pkg/rivix.exe', 'README.md', 'LICENSE-APACHE' -Destination 'stage-regular/'
+          Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile 'ffmpeg-dl/ffmpeg.zip'
+          Expand-Archive -Path 'ffmpeg-dl/ffmpeg.zip' -DestinationPath 'ffmpeg-dl/unpacked' -Force
+          $ffmpegExe = Get-ChildItem -Path 'ffmpeg-dl/unpacked' -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
+          $ffmpegLic = Get-ChildItem -Path 'ffmpeg-dl/unpacked' -Recurse -Filter 'LICENSE' | Select-Object -First 1
+          if (-not $ffmpegExe) { throw '未在解压目录中找到 ffmpeg.exe' }
+          Copy-Item -Path $ffmpegExe.FullName -Destination 'stage-regular/ffmpeg.exe' -Force
+          if ($ffmpegLic) { Copy-Item -Path $ffmpegLic.FullName -Destination 'stage-regular/ffmpeg-LICENSE.txt' -Force }
           Compress-Archive -Path 'stage-regular/*' -DestinationPath 'dist/rivix-${{ matrix.name }}.zip'
 
       - name: 打包（Linux/macOS）
