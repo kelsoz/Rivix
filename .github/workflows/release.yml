@@ -105,7 +105,7 @@ jobs:
             # 正式版本：git tag 已由 push 事件存在，这里只补上同名的 release。
             # 重复推同一个 tag（改代码后强制重打）时只补缺失的 release，不删已有附件、不碰 latest。
             if ! gh release view "$TAG" >/dev/null 2>&1; then
-              gh release create "$TAG" --title "Rupix 拾景 $TAG" --notes "版本发布 $TAG，三平台各两个包：常规版（解压即用，含外置 models/）与内嵌版（-bundled，模型打进二进制，单文件）。Windows 静态 CRT，免装运行库；Linux 基线 glibc ≥ 2.35（Ubuntu 22.04+ / Debian 12+ / Fedora 35+）。设置 → 通用提供「开机启动」开关（默认关闭，只写当前用户范围：Windows 注册表 / macOS LaunchAgents / Linux XDG autostart）。"
+              gh release create "$TAG" --title "Rivix 望川 $TAG" --notes "版本发布 $TAG：Windows 单文件绿色版（rivix.exe 解压即用，录屏按需搭配 ffmpeg.exe），另附 Linux / macOS 构建产物。Windows 静态 CRT 免装运行库；Linux 基线 glibc ≥ 2.35。"
             fi
             exit 0
           fi
@@ -119,7 +119,7 @@ jobs:
           gh release edit latest --title "最新构建（手动触发，滚动更新）" --notes "编译档：$PROF（size 体积最小，release 速度优先）；Windows 静态 CRT，免装运行库。
 
           滚动更新：全平台触发删旧建新；单平台触发只替换该平台附件，不碰其他的。
-          每个平台两个包：常规版 rupix-<平台>.zip（exe + 外置 models/，解压即用）；内嵌版 *-bundled.zip（模型打进二进制，单文件开箱即用，体积 +21MB）。
+          每个平台一个包：rivix-<平台>.zip / .tar.gz（单文件二进制 + README + LICENSE-APACHE，解压即用）。
           设置 → 通用提供「开机启动」开关（默认关闭，只写当前用户范围：Windows 注册表 / macOS LaunchAgents / Linux XDG autostart）。
           说明：Windows 为主力验证平台；Linux/macOS 为交叉尝试编译，未在真机完整验证，遇到问题欢迎提 Issue。
           Linux 基线：Ubuntu 22.04+ / Debian 12+ / Fedora 35+（glibc ≥ 2.35），更老系统请用源码编译。"
@@ -184,7 +184,7 @@ jobs:
           $prof = '${{ needs.prepare.outputs.profile }}'
           New-Item -ItemType Directory -Force -Path 'pkg' | Out-Null
           cargo build --profile $prof
-          Copy-Item -Path "target/$prof/rupix.exe" -Destination 'pkg/rupix-regular.exe'
+          Copy-Item -Path "target/$prof/rivix.exe" -Destination 'pkg/rivix.exe'
 
       - name: 编译（Linux/macOS）
         if: runner.os != 'Windows'
@@ -193,27 +193,24 @@ jobs:
           prof='${{ needs.prepare.outputs.profile }}'
           mkdir -p pkg
           cargo build --profile "$prof"
-          cp "target/$prof/rupix" pkg/rupix-regular
+          cp "target/$prof/rivix" pkg/rivix
 
       - name: 打包（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $prof = '${{ needs.prepare.outputs.profile }}'
           New-Item -ItemType Directory -Force -Path 'dist', 'stage-regular' | Out-Null
-          Copy-Item -Path 'pkg/rupix-regular.exe', 'README.md', 'LICENSE-APACHE' -Destination 'stage-regular/'
-          Rename-Item -Path 'stage-regular/rupix-regular.exe' -NewName 'rupix.exe'
-          Compress-Archive -Path 'stage-regular/*' -DestinationPath 'dist/rupix-${{ matrix.name }}.zip'
+          Copy-Item -Path 'pkg/rivix.exe', 'README.md', 'LICENSE-APACHE' -Destination 'stage-regular/'
+          Compress-Archive -Path 'stage-regular/*' -DestinationPath 'dist/rivix-${{ matrix.name }}.zip'
 
       - name: 打包（Linux/macOS）
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          prof='${{ needs.prepare.outputs.profile }}'
           mkdir -p dist stage-regular
-          cp pkg/rupix-regular stage-regular/rupix
+          cp pkg/rivix stage-regular/rivix
           cp README.md LICENSE-APACHE stage-regular/
-          tar -czf "dist/rupix-${{ matrix.name }}.tar.gz" -C stage-regular .
+          tar -czf "dist/rivix-${{ matrix.name }}.tar.gz" -C stage-regular .
 
       # 冒烟（--version/--help 启动检查、cargo test、glibc 基线）已移到 ci.yml：
       # push/PR 都会先跑一遍，发版流程只管编译 + 上传，不再重复等待这些检查。

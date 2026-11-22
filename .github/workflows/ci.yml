@@ -132,7 +132,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $exe = (Resolve-Path -LiteralPath '.\target\release\rupix.exe').Path
+          $exe = (Resolve-Path -LiteralPath '.\target\release\rivix.exe').Path
           foreach ($flag in '--version', '--help') {
             $proc = Start-Process -FilePath $exe -ArgumentList $flag -NoNewWindow -Wait -PassThru
             if ($proc.ExitCode -ne 0) { throw "冒烟失败：$flag（退出码 $($proc.ExitCode)）" }
@@ -142,8 +142,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          ./target/release/rupix --version
-          ./target/release/rupix --help >/dev/null
+          ./target/release/rivix --version
+          ./target/release/rivix --help >/dev/null
 
       # 单测复用 release 档依赖（同 profile 不重编），只重编工作区的测试目标。
       # 用 --bins：examples 是历史 spike，不参与发版，也不该卡 CI。
@@ -157,9 +157,9 @@ jobs:
         shell: bash
         run: |
           echo 'glibc 基线需求（最高三行）：'
-          objdump -T target/release/rupix | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3
+          objdump -T target/release/rivix | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3
 
       - name: 依赖库检查（macOS，仅信息）
         if: runner.os == 'macOS'
         shell: bash
-        run: otool -L target/release/rupix
+        run: otool -L target/release/rivix
