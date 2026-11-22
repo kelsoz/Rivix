@@ -9,7 +9,7 @@
 [![CI](https://github.com/kelsoz/Rivix/actions/workflows/ci.yml/badge.svg)](https://github.com/kelsoz/Rivix/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/kelsoz/Rivix)](https://github.com/kelsoz/Rivix/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
 
 ![标注编辑](assets/screenshots/viewer.png)
 
