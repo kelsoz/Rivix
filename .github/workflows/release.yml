@@ -95,10 +95,19 @@ jobs:
           INPUT_PLATFORM: ${{ inputs.platform }}
         run: |
           if [ "$TAG" != "latest" ]; then
-            # 正式版本：git tag 已由 push 事件存在，这里只补上同名的 release。
-            # 重复推同一个 tag（改代码后强制重打）时只补缺失的 release，不删已有附件、不碰 latest。
+            # 正式版本：从 CHANGELOG.md 自动提取对应版本号的中文更新日志；缺失时使用默认兜底文案。
+            ver="${TAG#v}"
+            awk -v v="[$ver]" '
+              $0 ~ "^## " { if (found) exit; if (index($0, v) > 0) { found=1; next } }
+              found { print }
+            ' CHANGELOG.md > release-notes.md
+            if [ ! -s release-notes.md ]; then
+              echo "版本发布 $TAG：Windows 绿色开箱版（含 rivix.exe 与录屏用 ffmpeg.exe 及 ffmpeg-LICENSE.txt，解压即用，静态 CRT 免装运行库）。" > release-notes.md
+            fi
             if ! gh release view "$TAG" >/dev/null 2>&1; then
-              gh release create "$TAG" --title "Rivix 望川 $TAG" --notes "版本发布 $TAG：Windows 绿色开箱版（含 rivix.exe 与录屏用 ffmpeg.exe 及 ffmpeg-LICENSE.txt，解压即用，静态 CRT 免装运行库）。"
+              gh release create "$TAG" --title "Rivix 望川 $TAG" --notes-file release-notes.md
+            else
+              gh release edit "$TAG" --title "Rivix 望川 $TAG" --notes-file release-notes.md
             fi
             exit 0
           fi
