@@ -912,8 +912,17 @@ impl ImageViewer {
                         (lines.len().max(1) as f32) * size * TEXT_LINE_HEIGHT,
                     )
                 } else {
-                    let w = measure_line_width(window, content, *size, family);
-                    PixelRect::new(pos.0, pos.1, w.max(*size * 0.5), size * TEXT_LINE_HEIGHT)
+                    let lines: Vec<&str> = content.split('\n').collect();
+                    let w = lines
+                        .iter()
+                        .map(|line| measure_line_width(window, line, *size, family))
+                        .fold(0.0f32, f32::max);
+                    PixelRect::new(
+                        pos.0,
+                        pos.1,
+                        w.max(*size * 0.5),
+                        (lines.len().max(1) as f32) * size * TEXT_LINE_HEIGHT,
+                    )
                 }
             }
             Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. } | Shape::Mosaic { rect } => {
@@ -1970,11 +1979,10 @@ impl ImageViewer {
             });
             self.sync_hsv_from_color(color);
             let input = cx.new(|cx| {
-                if max_w.is_some() {
-                    InputState::new(window, cx).auto_grow(1, 64).soft_wrap(true)
-                } else {
-                    InputState::new(window, cx)
-                }
+                // 无论点选还是拖框文字，均开启多行输入；仅拖框文字启用自动软折行。
+                InputState::new(window, cx)
+                    .auto_grow(1, 64)
+                    .soft_wrap(max_w.is_some())
             });
             input.update(cx, |state, cx| {
                 state.set_value(content, window, cx);
@@ -2608,11 +2616,10 @@ impl ImageViewer {
         cx: &mut Context<Self>,
     ) {
         let input = cx.new(|cx| {
-            if max_w.is_some() {
-                InputState::new(window, cx).auto_grow(1, 64).soft_wrap(true)
-            } else {
-                InputState::new(window, cx)
-            }
+            // 无论点选还是拖框文字，均开启多行输入；仅拖框文字启用自动软折行。
+            InputState::new(window, cx)
+                .auto_grow(1, 64)
+                .soft_wrap(max_w.is_some())
         });
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
         self.text_editing = Some(TextEdit {
@@ -4029,17 +4036,16 @@ impl Render for ImageViewer {
                     }
                     return;
                 }
-                if let Some(editing) = &this.text_editing {
-                    let is_area = editing.max_w.is_some();
+                if this.text_editing.is_some() {
                     match ev.keystroke.key.as_str() {
-                        // 单次 Esc 提交文字并直接切回选择工具；单行回车或段落 Ctrl+Enter 仅提交文字。
+                        // 单次 Esc 提交文字并直接切回选择工具；Ctrl+Enter 提交文字，普通 Enter 保留换行。
                         "escape" => {
                             this.commit_text(window, cx);
                             this.tool = AnnoTool::Select;
                             cx.notify();
                             cx.stop_propagation();
                         }
-                        "enter" if !is_area || modi.control => {
+                        "enter" if modi.control => {
                             this.commit_text(window, cx);
                             cx.stop_propagation();
                         }
@@ -4314,7 +4320,13 @@ impl Render for ImageViewer {
                                             }),
                                         );
                                     } else {
-                                        node = node.whitespace_nowrap().child(content.clone());
+                                        let lines = content.split('\n');
+                                        node = node.flex().flex_col().children(lines.map(|line| {
+                                            div()
+                                                .h(px(lh))
+                                                .whitespace_nowrap()
+                                                .child(line.to_string())
+                                        }));
                                     }
                                     node
                                 };
@@ -4402,13 +4414,20 @@ impl Render for ImageViewer {
                                     .child(input);
                                 marks.push(area_box);
                             } else {
-                                input.style().size.height = Some(px(line_height).into());
-                                let measured = measure_line_width(
-                                    window,
-                                    &value,
-                                    input_text_size,
-                                    &edit_family,
-                                );
+                                let lines_count = value.split('\n').count().max(1);
+                                let box_height = lines_count as f32 * line_height;
+                                input.style().size.height = Some(px(box_height).into());
+                                let measured = value
+                                    .split('\n')
+                                    .map(|line| {
+                                        measure_line_width(
+                                            window,
+                                            line,
+                                            input_text_size,
+                                            &edit_family,
+                                        )
+                                    })
+                                    .fold(0.0f32, f32::max);
                                 let box_width =
                                     (measured + input_text_size + 4.0).max(input_text_size * 2.0);
                                 let mut editor = div()
@@ -4416,7 +4435,7 @@ impl Render for ImageViewer {
                                     .left(px(editing.img_pos.0 * zoom))
                                     .top(px(editing.img_pos.1 * zoom))
                                     .w(px(box_width))
-                                    .h(px(line_height))
+                                    .h(px(box_height))
                                     .text_color(self.color.to_rgpui())
                                     .text_size(px(input_text_size))
                                     .line_height(px(line_height));

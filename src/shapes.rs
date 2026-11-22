@@ -338,8 +338,17 @@ impl Shape {
                         (lines.max(1) as f32) * size * TEXT_LINE_HEIGHT,
                     )
                 } else {
-                    let w: f32 = content.chars().map(char_w).sum();
-                    PixelRect::new(pos.0, pos.1, w, size * TEXT_LINE_HEIGHT)
+                    let lines: Vec<&str> = content.split('\n').collect();
+                    let w: f32 = lines
+                        .iter()
+                        .map(|line| line.chars().map(char_w).sum::<f32>())
+                        .fold(0.0f32, f32::max);
+                    PixelRect::new(
+                        pos.0,
+                        pos.1,
+                        w,
+                        (lines.len().max(1) as f32) * size * TEXT_LINE_HEIGHT,
+                    )
                 }
             }
         }

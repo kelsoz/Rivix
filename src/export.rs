@@ -837,17 +837,20 @@ fn draw_shape(
                         );
                     }
                 } else {
-                    draw_text(
-                        img,
-                        font,
-                        (x, y),
-                        content,
-                        *color,
-                        *size,
-                        bg_fill,
-                        text_stroke,
-                        clip,
-                    );
+                    let line_step = *size * crate::shapes::TEXT_LINE_HEIGHT;
+                    for (idx, line) in content.split('\n').enumerate() {
+                        draw_text(
+                            img,
+                            font,
+                            (x, y + idx as f32 * line_step),
+                            line,
+                            *color,
+                            *size,
+                            bg_fill,
+                            text_stroke,
+                            clip,
+                        );
+                    }
                 }
             }
         }
