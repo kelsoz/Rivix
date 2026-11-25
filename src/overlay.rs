@@ -490,9 +490,9 @@ impl SelectView {
         }
     }
 
-    /// C 复制当前光标像素的 HEX 并结束整轮截图；不裁剪或保存图片。
+    /// C 复制当前光标像素的 HEX 并结束整轮截图；无需拖出选区，也不裁剪或保存图片。
     fn copy_color(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.anchor.is_none() || self.session.is_finished() {
+        if self.session.is_finished() {
             return;
         }
         let Some(pointer) = self.pointer else {
