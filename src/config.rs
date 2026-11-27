@@ -30,7 +30,7 @@ pub struct AppConfig {
     pub version: u32,
     /// 截图默认保存目录；`None` 表示用系统图片库默认目录。
     pub save_dir: Option<PathBuf>,
-    /// 三个系统级全局热键；`None` 表示用出厂默认组合。
+    /// 四个系统级全局热键；`None` 表示用出厂默认组合。
     pub hotkeys: Hotkeys,
     /// 界面语言代码（`zh` / `en` / 外部 `lang-<code>.txt` 的 `code`）。
     pub lang: Option<String>,
@@ -59,7 +59,7 @@ impl Default for AppConfig {
     }
 }
 
-/// 三个全局热键的按键串（如 `ctrl-shift-a`，与 `Keystroke::parse` 同格式）。
+/// 四个全局热键的按键串（如 `ctrl-shift-a`，与 `Keystroke::parse` 同格式）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hotkeys {
@@ -69,6 +69,8 @@ pub struct Hotkeys {
     pub full: Option<String>,
     /// 屏幕取色。
     pub picker: Option<String>,
+    /// 长截图。
+    pub long: Option<String>,
 }
 
 /// 手动指定的 OCR 模型三件套与后端模式。

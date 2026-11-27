@@ -299,6 +299,21 @@ pub fn trigger_capture(
     });
 }
 
+/// 从 App 上下文触发长截图（全局热键入口）。
+pub fn trigger_long(cx: &mut App, main_win: WindowHandle<RivixApp>, main: Entity<RivixApp>) {
+    if crate::record::is_recording() {
+        return;
+    }
+    if crate::overlay::request_long_selection(cx) {
+        return;
+    }
+    let _ = cx.update_window(main_win.into(), |_, window, cx| {
+        cx.update_entity(&main, |view, viewcx| {
+            view.begin_long(window, viewcx);
+        });
+    });
+}
+
 /// 从 App 上下文触发取色（托盘菜单 / 全局热键共用）。
 ///
 /// 与截图同理：借主窗口发起，后续浮层是独立新窗口。

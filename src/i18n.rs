@@ -356,6 +356,13 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
                 "Color picker"
             }
         }
+        "hotkey.long" => {
+            if zh {
+                "长截图"
+            } else {
+                "Long capture"
+            }
+        }
         "hotkey.parse_fail" => {
             if zh {
                 "快捷键解析失败（{hotkey}）：{error}"
@@ -1127,6 +1134,76 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
                 "已截取，在遮罩上拖拽框选…"
             } else {
                 "Captured, drag on the mask to select…"
+            }
+        }
+        "cap.long_hint" => {
+            if zh {
+                "已截取，拖拽选择要拼接的屏幕区域…"
+            } else {
+                "Captured, drag to select the scrolling region…"
+            }
+        }
+        "long.select_hint" => {
+            if zh {
+                "调整选区后点击「开始滚动截屏」；Esc 取消"
+            } else {
+                "Adjust the region, then click Start scrolling capture; Esc to cancel"
+            }
+        }
+        "long.start" => {
+            if zh {
+                "开始滚动截屏"
+            } else {
+                "Start scrolling capture"
+            }
+        }
+        "long.capturing" => {
+            if zh {
+                "正在拼接长截图，请向下滚动目标页面…"
+            } else {
+                "Stitching long capture; scroll the target page down…"
+            }
+        }
+        "long.progress" => {
+            if zh {
+                "长截图 {w} × {h}"
+            } else {
+                "Long capture {w} × {h}"
+            }
+        }
+        "long.save" => {
+            if zh {
+                "保存"
+            } else {
+                "Save"
+            }
+        }
+        "long.finish" => {
+            if zh {
+                "完成"
+            } else {
+                "Finish"
+            }
+        }
+        "long.cancel" => {
+            if zh {
+                "取消"
+            } else {
+                "Cancel"
+            }
+        }
+        "long.done" => {
+            if zh {
+                "长截图已完成：{w} × {h}（{note}）"
+            } else {
+                "Long capture complete: {w} × {h} ({note})"
+            }
+        }
+        "long.failed" => {
+            if zh {
+                "长截图失败：{error}"
+            } else {
+                "Long capture failed: {error}"
             }
         }
         "cap.auto_saved" => {

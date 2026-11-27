@@ -511,7 +511,7 @@ pub fn start_recording(
 }
 
 /// 按 DisplayId 选取对应的系统捕获源（无精确匹配时回退主屏或首个源）。
-fn pick_source_for_display(
+pub(crate) fn pick_source_for_display(
     sources: &[Rc<dyn ScreenCaptureSource>],
     target: Option<DisplayId>,
     primary_id: Option<DisplayId>,
@@ -573,7 +573,7 @@ fn next_recording_path(format: RecordFormat) -> PathBuf {
 }
 
 /// 裁剪整屏 RGBA 到偶数对齐的目标矩形（越界时安全钳制）。
-fn crop_rgba_clamped(src: &RgbaImage, crop: (u32, u32, u32, u32)) -> RgbaImage {
+pub(crate) fn crop_rgba_clamped(src: &RgbaImage, crop: (u32, u32, u32, u32)) -> RgbaImage {
     let (sw, sh) = src.dimensions();
     let x = crop.0.min(sw.saturating_sub(2));
     let y = crop.1.min(sh.saturating_sub(2));

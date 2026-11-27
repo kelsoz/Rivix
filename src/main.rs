@@ -10,6 +10,7 @@ mod export;
 mod feedback;
 mod hotkey;
 mod i18n;
+mod longshot;
 mod ocr;
 mod overlay;
 mod picker;
@@ -72,10 +73,11 @@ fn main() {
             });
         }
 
-        // 读取用户保存的热键（区域 / 全屏 / 取色各一个），首次运行使用默认值。
+        // 读取用户保存的热键（区域 / 全屏 / 取色 / 长截图各一个），首次运行使用默认值。
         let region_hotkey = hotkey::load_hotkey_string(HotkeyKind::Region);
         let full_hotkey = hotkey::load_hotkey_string(HotkeyKind::Full);
         let picker_hotkey = hotkey::load_hotkey_string(HotkeyKind::Picker);
+        let long_hotkey = hotkey::load_hotkey_string(HotkeyKind::Long);
 
         // 主窗口实体需要在构建闭包外使用，用容器带出来。
         let main_cell: Rc<RefCell<Option<Entity<RivixApp>>>> = Rc::new(RefCell::new(None));
@@ -141,13 +143,14 @@ fn main() {
         // 托盘常驻：截图入口与退出都走这里。
         tray::setup_tray(cx, main_win, main.clone());
 
-        // 注册三个系统级全局热键（失焦可用），触发走托盘同款入口。
+        // 区域 / 全屏 / 取色可注册全局热键；长截图旧配置由热键模块强制停用。
         // 全部成功才报组合状态，任一失败展示全部错误（成功的不受影响）。
         let region_result = hotkey::apply_global_hotkey(cx, HotkeyKind::Region, &region_hotkey);
         let full_result = hotkey::apply_global_hotkey(cx, HotkeyKind::Full, &full_hotkey);
         let picker_result = hotkey::apply_global_hotkey(cx, HotkeyKind::Picker, &picker_hotkey);
+        let long_result = hotkey::apply_global_hotkey(cx, HotkeyKind::Long, &long_hotkey);
         let mut boot_errors = Vec::new();
-        for result in [&region_result, &full_result, &picker_result] {
+        for result in [&region_result, &full_result, &picker_result, &long_result] {
             if let Err(error) = result {
                 boot_errors.push(error.clone());
             }
@@ -157,6 +160,7 @@ fn main() {
             main.update(cx, |view, cx| view.set_status(&err_msg, cx));
         }
         cx.on_global_hotkey(move |id, cx| {
+            crate::capture::cap_log(&format!("全局热键触发：{id}"));
             // 按编号分发截图种类或停止录屏，其他全局热键（若有）忽略。
             if id == record::STOP_HOTKEY_SHIFT_ESC_ID {
                 record::stop_active();
@@ -166,6 +170,12 @@ fn main() {
                 tray::trigger_capture(cx, main_win, main.clone(), true);
             } else if id == HotkeyKind::Picker.id() {
                 tray::trigger_picker(cx, main_win, main.clone());
+            } else if id == longshot::FINISH_HOTKEY_ID {
+                longshot::finish_active();
+            } else if id == longshot::CANCEL_HOTKEY_ID {
+                longshot::cancel_active();
+            } else if id == HotkeyKind::Long.id() {
+                tray::trigger_long(cx, main_win, main.clone());
             }
         });
 

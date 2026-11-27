@@ -7,7 +7,7 @@
 
 use crate::{
     autostart,
-    capture::{begin_capture, begin_picker, cap_log},
+    capture::{CaptureMode, begin_capture, begin_picker, cap_log},
     config, export,
     hotkey::{HotkeyKind, apply_global_hotkey, hotkey_value_to_string, save_hotkey_string},
     i18n::{available_langs, lang, set_lang, tr, tr_fmt},
@@ -603,12 +603,17 @@ impl RivixApp {
 
     /// 发起区域截图（框选时可按 F/B/V/T/C/S/P/Q）。
     pub fn begin_region(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        begin_capture(self, window, cx, false);
+        begin_capture(self, window, cx, CaptureMode::Region);
     }
 
     /// 发起全屏截图。
     pub fn begin_full(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        begin_capture(self, window, cx, true);
+        begin_capture(self, window, cx, CaptureMode::Full);
+    }
+
+    /// 发起长截图。
+    pub fn begin_long(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        begin_capture(self, window, cx, CaptureMode::Long);
     }
 
     /// 发起屏幕取色。

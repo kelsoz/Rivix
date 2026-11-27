@@ -30,7 +30,18 @@ use crate::{
     overlay::open_overlays,
 };
 
-/// 单块显示器上的首帧捕获结果（区域截图 / 取色 / 全屏共用）。
+/// 截图模式：区域、全屏与长截图共用首帧捕获流程。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// 区域截图。
+    Region,
+    /// 全屏截图。
+    Full,
+    /// 长截图。
+    Long,
+}
+
+/// 单块显示器上的首帧捕获结果（区域截图 / 取色 / 全屏 / 长截图共用）。
 pub struct CapturedFrame {
     /// 首帧原始像素（裁剪与采样共享，不重复解码）。
     pub pixels: Arc<image::RgbaImage>,
@@ -71,12 +82,12 @@ enum CaptureFailure {
 /// - `state`: 主视图可变引用（调用方已持有实体租借，直接改状态，不要再 `update`）。
 /// - `window`: 发起截图的窗口，用于挂载后台任务。
 /// - `cx`: 主视图上下文。
-/// - `fullscreen`: 为 true 时浮层打开即选中全图，跳过手动选区。
+/// - `mode`: 区域、全屏或长截图模式。
 pub fn begin_capture(
     state: &mut RivixApp,
     window: &mut Window,
     cx: &mut Context<RivixApp>,
-    fullscreen: bool,
+    mode: CaptureMode,
 ) {
     // 同一时间只允许一轮截取，避免重复推流占用系统捕获会话。
     if state.capturing {
@@ -89,7 +100,12 @@ pub fn begin_capture(
     let displays = display_targets(cx);
     let primary_id = cx.primary_display().map(|display| display.id());
     cap_log(&format!(
-        "任务启动：显示器 {} 台，主屏 {:?}",
+        "任务启动：模式 {}，显示器 {} 台，主屏 {:?}",
+        match mode {
+            CaptureMode::Region => "区域",
+            CaptureMode::Full => "全屏",
+            CaptureMode::Long => "长截图",
+        },
         displays.len(),
         primary_id
     ));
@@ -99,7 +115,7 @@ pub fn begin_capture(
         let Some(frames) = capture_displays(&this, cx, displays, primary_id).await else {
             return;
         };
-        if fullscreen {
+        if mode == CaptureMode::Full {
             let result =
                 cx.background_executor()
                     .spawn(async move {
@@ -131,10 +147,18 @@ pub fn begin_capture(
             return;
         }
         // 内存首帧直接交给浮层，进入框选前不再编码或读写 PNG。
+        let long = mode == CaptureMode::Long;
         let updated = this
             .update(cx, |state, cx| {
-                state.set_status(&tr("cap.region_hint"), cx);
-                if !open_overlays(cx.entity(), cx, frames) {
+                state.set_status(
+                    &tr(if long {
+                        "cap.long_hint"
+                    } else {
+                        "cap.region_hint"
+                    }),
+                    cx,
+                );
+                if !open_overlays(cx.entity(), cx, frames, long) {
                     state.capturing = false;
                     state.set_status(&tr("cap.overlay_fail"), cx);
                 }

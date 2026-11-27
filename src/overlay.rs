@@ -8,15 +8,15 @@
 
 use std::{
     cell::{Cell, RefCell},
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::Arc,
 };
 
 use rgpui::{
-    AnyWindowHandle, AppContext, Bounds, Context, CursorStyle, Entity, FocusHandle, KeyDownEvent,
-    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div,
-    img, prelude::*, px, rgb, rgba,
+    AnyWindowHandle, App, AppContext, Bounds, Context, CursorStyle, Entity, FocusHandle,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
+    WindowOptions, div, img, prelude::*, px, rgb, rgba,
 };
 
 use crate::{
@@ -24,8 +24,13 @@ use crate::{
     capture::{CapturedFrame, cap_log},
     config,
     i18n::{tr, tr_fmt},
-    ocr, picker, qr, record,
+    longshot, ocr, picker, qr, record,
 };
+
+thread_local! {
+    /// 当前框选会话的弱引用，供全局 L 在不重复抓屏的情况下切换长截图模式。
+    static ACTIVE_OVERLAY: RefCell<Option<Weak<OverlaySession>>> = const { RefCell::new(None) };
+}
 
 /// 一轮多屏浮层的共享会话：任一处完成 / 取消 / 被系统关闭时，统一关掉同轮其余浮层。
 pub struct OverlaySession {
@@ -33,6 +38,8 @@ pub struct OverlaySession {
     handles: RefCell<Vec<Option<AnyWindowHandle>>>,
     /// 本轮是否已结束（结束后其余浮层只关窗、不再重复收尾）。
     finished: Cell<bool>,
+    /// 全局 L 是否请求把本轮框选切换为长截图。
+    long_requested: Cell<bool>,
 }
 
 impl OverlaySession {
@@ -41,6 +48,7 @@ impl OverlaySession {
         Rc::new(Self {
             handles: RefCell::new(Vec::new()),
             finished: Cell::new(false),
+            long_requested: Cell::new(false),
         })
     }
 
@@ -58,11 +66,29 @@ impl OverlaySession {
         self.finished.get()
     }
 
+    /// 请求本轮框选直接切换为长截图，不重新捕获屏幕。
+    fn request_long(&self) -> bool {
+        if self.finished.get() {
+            return false;
+        }
+        self.long_requested.set(true);
+        true
+    }
+
     /// 结束整轮并关闭除 `keep` 以外的浮层；返回是否由本次调用触发结束。
     pub(crate) fn finish<C: AppContext>(&self, keep: Option<usize>, cx: &mut C) -> bool {
         if self.finished.replace(true) {
             return false;
         }
+        ACTIVE_OVERLAY.with(|active| {
+            let mut active = active.borrow_mut();
+            if active
+                .as_ref()
+                .is_some_and(|weak| std::ptr::eq(Weak::as_ptr(weak), self))
+            {
+                *active = None;
+            }
+        });
         let handles = self.handles.borrow().clone();
         for (index, handle) in handles.into_iter().enumerate() {
             if Some(index) == keep {
@@ -83,6 +109,7 @@ impl OverlaySession {
 /// - `main`: 主视图实体（裁剪完成后回写预览图 / 取消时恢复状态）。
 /// - `cx`: 调用方上下文（可解引用为 `App`）。
 /// - `frames`: 每块屏的首帧图片与显示器边界。
+/// - `long`: 是否为长截图选区模式。
 ///
 /// # 返回
 /// 至少成功打开一层返回 `true`（之后由浮层的完成 / 取消复位状态）；
@@ -91,22 +118,45 @@ pub fn open_overlays(
     main: Entity<RivixApp>,
     cx: &mut Context<RivixApp>,
     frames: Vec<CapturedFrame>,
+    long: bool,
 ) -> bool {
     if frames.is_empty() {
         return false;
     }
     let session = OverlaySession::new();
+    ACTIVE_OVERLAY.with(|active| *active.borrow_mut() = Some(Rc::downgrade(&session)));
     let mut opened = 0;
     for (index, frame) in frames.into_iter().enumerate() {
         // 极少数情况下前一块屏的浮层已结束整轮，不再补开。
         if session.is_finished() {
             break;
         }
-        if open_overlay(main.clone(), cx, frame, index, session.clone()) {
+        if open_overlay(main.clone(), cx, frame, index, session.clone(), long) {
             opened += 1;
         }
     }
+    if opened == 0 {
+        session.finish(None, cx);
+    }
     opened > 0
+}
+
+/// 把全局 L 转交给当前框选会话，使其原地切换为长截图模式。
+///
+/// # 返回
+/// 存在未结束的框选浮层并已接收请求时返回 `true`。
+pub fn request_long_selection(cx: &mut App) -> bool {
+    let session = ACTIVE_OVERLAY.with(|active| active.borrow().as_ref().and_then(Weak::upgrade));
+    let Some(session) = session else {
+        return false;
+    };
+    if !session.request_long() {
+        ACTIVE_OVERLAY.with(|active| *active.borrow_mut() = None);
+        return false;
+    }
+    // Windows 全局热键不会把 L 再投递成普通按键，只能主动重绘浮层读取共享请求。
+    cx.refresh_windows();
+    true
 }
 
 /// 打开单块屏的区域选择浮层。
@@ -116,6 +166,7 @@ fn open_overlay(
     frame: CapturedFrame,
     index: usize,
     session: Rc<OverlaySession>,
+    long: bool,
 ) -> bool {
     let (img_w, img_h) = (frame.img_w, frame.img_h);
     let CapturedFrame {
@@ -150,6 +201,10 @@ fn open_overlay(
             ..Default::default()
         },
         move |window, cx| {
+            // 长截图推流可能早于浮层销毁一帧，先排除自身，避免把遮罩拼进结果。
+            if long {
+                crate::window::exclude_from_capture(window);
+            }
             // 浮层被系统直接关掉（Alt+F4 等）时也要结束整轮并复位状态机，
             // 否则 capturing 永远为 true，之后所有截图入口都会被挡住。
             let main_for_close = main.clone();
@@ -176,6 +231,7 @@ fn open_overlay(
                     frame_image.clone(),
                     session_for_build.clone(),
                     index,
+                    long,
                 )
             });
             // 浮层打开即聚焦根视图并激活窗口，使 Esc 立即可用。
@@ -246,6 +302,8 @@ struct SelectView {
     display_bounds: Bounds<Pixels>,
     /// 按 V 进入的录屏准备态（允许调整比例、标准尺寸、格式与音频后再开录）。
     recording_prep: Option<RecordPrepState>,
+    /// 是否为长截图选区模式。
+    long_capture: bool,
 }
 
 /// 按四边命中掩码返回对应的窗口调整大小光标样式。
@@ -306,6 +364,7 @@ impl SelectView {
         frame_image: Arc<RenderImage>,
         session: Rc<OverlaySession>,
         index: usize,
+        long_capture: bool,
     ) -> Self {
         let view_w = display_bounds.size.width.as_f32();
         let view_h = display_bounds.size.height.as_f32();
@@ -353,6 +412,14 @@ impl SelectView {
             display_id,
             display_bounds,
             recording_prep: None,
+            long_capture,
+        }
+    }
+
+    /// 同步全局 L 的模式切换请求，保留当前拖拽状态与选区。
+    fn sync_long_mode(&mut self) {
+        if self.session.long_requested.get() {
+            self.long_capture = true;
         }
     }
 
@@ -590,6 +657,20 @@ impl SelectView {
         cx.notify();
     }
 
+    /// 立即锁定长截图选区并进入准备态，复用录屏的选区移动与缩放交互。
+    fn enter_long_prep(&mut self, rect: (f32, f32, f32, f32), cx: &mut Context<Self>) {
+        // 消费原来的鼠标拖拽；后续鼠标移动或松开都不能提交截图。
+        self.enter_recording_prep(cx);
+        if let Some(prep) = self.recording_prep.as_mut() {
+            prep.rect = rect;
+            prep.drag = None;
+        }
+        self.space_held = false;
+        self.session.request_long();
+        self.sync_long_mode();
+        cx.notify();
+    }
+
     /// 录屏准备态下按下左键：边缘/角点缩放（14px 热区），框内平移，框外按住拖动可重画新框。
     fn prep_left_down(&mut self, p: (f32, f32), cx: &mut Context<Self>) {
         let Some(ref mut prep) = self.recording_prep else {
@@ -794,10 +875,11 @@ impl SelectView {
         cx.refresh_windows();
     }
 
-    /// 渲染录屏准备态的悬浮控制条（比例预设、标准尺寸、格式/帧率/声音、开始/取消）。
-    fn render_record_prep_bar(
+    /// 共用两行准备面板：上排比例与尺寸预设，下排当前尺寸及模式对应操作。
+    fn render_capture_prep_bar(
         &self,
         rect: (f32, f32, f32, f32),
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let Some(ref prep) = self.recording_prep else {
@@ -805,9 +887,56 @@ impl SelectView {
         };
         let p = palette();
         let (sx, sy) = self.scale();
-        let phys_w = ((rect.2 * sx).round() as u32 & !1).max(16);
-        let phys_h = ((rect.3 * sy).round() as u32 & !1).max(16);
-        let bar_w = 604.0f32;
+        // 录屏要求偶数尺寸，长截图保留真实像素，显示值必须与实际裁剪一致。
+        let dimensions = ((rect.2 * sx).round() as u32, (rect.3 * sy).round() as u32);
+        let (phys_w, phys_h) = if self.long_capture {
+            dimensions
+        } else {
+            ((dimensions.0 & !1).max(16), (dimensions.1 & !1).max(16))
+        };
+        let accent = if self.long_capture {
+            0x0078D4
+        } else {
+            0xC92A2A
+        };
+        // 按首排实际字体测量宽度，再加按钮边框、内边距与固定间隙，不预留伸缩空白。
+        let labels: Vec<String> = record::AspectPreset::ALL
+            .into_iter()
+            .map(|preset| preset.label())
+            .chain(
+                record::SIZE_PRESETS
+                    .iter()
+                    .map(|(label, _, _)| (*label).to_string()),
+            )
+            .chain(std::iter::once(tr("rec.fullscreen")))
+            .collect();
+        let rem = window.rem_size().as_f32();
+        let text_width: f32 = labels
+            .iter()
+            .map(|label| {
+                window
+                    .text_system()
+                    .shape_line(
+                        label.clone().into(),
+                        px(rem * 0.75),
+                        &[rgpui::TextRun {
+                            len: label.len(),
+                            font: window.text_style().font(),
+                            color: rgb(p.text).into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    )
+                    .width
+                    .as_f32()
+            })
+            .sum();
+        let count = labels.len() as f32;
+        let bar_w = (text_width + count * (rem + 2.0) + (count - 1.0) * rem * 0.25 + rem + 2.0)
+            .ceil()
+            .min((self.view_w - 16.0).max(1.0));
         let bar_h = 74.0f32;
         let bar_x =
             (rect.0 + (rect.2 - bar_w) * 0.5).clamp(8.0, (self.view_w - bar_w - 8.0).max(8.0));
@@ -817,10 +946,10 @@ impl SelectView {
             (rect.1 - bar_h - 8.0).max(8.0)
         };
 
-        let mut row1 = div().flex().items_center().gap_1();
+        let mut ratios = div().flex().items_center().gap_1();
         for preset in record::AspectPreset::ALL {
             let active = prep.ratio == preset;
-            row1 = row1.child(
+            ratios = ratios.child(
                 div()
                     .id(("rec-ratio", preset as usize))
                     .px_2()
@@ -845,9 +974,10 @@ impl SelectView {
                     .child(preset.label()),
             );
         }
+        let mut sizes = div().flex().items_center().gap_1();
         for (idx, (label, tw, th)) in record::SIZE_PRESETS.iter().enumerate() {
             let (tw, th) = (*tw, *th);
-            row1 = row1.child(
+            sizes = sizes.child(
                 div()
                     .id(("rec-size", idx))
                     .px_2()
@@ -872,7 +1002,7 @@ impl SelectView {
                     .child(*label),
             );
         }
-        row1 = row1.child(
+        sizes = sizes.child(
             div()
                 .id("rec-size-fullscreen")
                 .px_2()
@@ -896,90 +1026,101 @@ impl SelectView {
                 .child(tr("rec.fullscreen")),
         );
 
-        let mut row2 = div().flex().items_center().justify_between().gap_2().child(
+        // 首排只用固定间隙紧凑排列，第二排左右分组各自贴齐边缘。
+        let row1 = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(ratios)
+            .child(sizes);
+        let details = div().flex().items_center().gap_1().child(
             div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(p.muted))
-                        .mr_1()
-                        .child(format!("{phys_w}×{phys_h}")),
-                )
-                .child(
-                    div()
-                        .id("rec-fmt-btn")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(rgb(p.card))
-                        .border_1()
-                        .border_color(rgb(p.border))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(ref mut pr) = this.recording_prep {
-                                pr.format = match pr.format {
-                                    record::RecordFormat::Mp4 => record::RecordFormat::Gif,
-                                    record::RecordFormat::Gif => record::RecordFormat::Mp4,
-                                };
-                                cx.notify();
-                            }
-                        }))
-                        .child(prep.format.as_str().to_uppercase()),
-                )
-                .child(
-                    div()
-                        .id("rec-fps-btn")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(rgb(p.card))
-                        .border_1()
-                        .border_color(rgb(p.border))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(ref mut pr) = this.recording_prep {
-                                pr.fps = match pr.fps {
-                                    15 => 30,
-                                    30 => 60,
-                                    _ => 15,
-                                };
-                                cx.notify();
-                            }
-                        }))
-                        .child(format!("{} fps", prep.fps)),
-                ),
-        );
-
-        let mut actions = div().flex().items_center().gap_1().child(
-            div()
-                .id("rec-cursor-btn")
-                .px_2()
-                .py_0p5()
-                .rounded_sm()
                 .text_xs()
-                .cursor_pointer()
-                .bg(rgb(if prep.show_cursor { p.selected } else { p.card }))
-                .text_color(rgb(if prep.show_cursor {
-                    p.selected_text
-                } else {
-                    p.muted
-                }))
-                .border_1()
-                .border_color(rgb(p.border))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(ref mut pr) = this.recording_prep {
-                        pr.show_cursor = !pr.show_cursor;
-                        cx.notify();
-                    }
-                }))
-                .child(tr("rec.cursor")),
+                .text_color(rgb(p.muted))
+                .child(format!("{phys_w}×{phys_h}")),
         );
-        if prep.format == record::RecordFormat::Mp4 {
+        let options = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id("rec-fmt-btn")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(rgb(p.card))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(ref mut pr) = this.recording_prep {
+                            pr.format = match pr.format {
+                                record::RecordFormat::Mp4 => record::RecordFormat::Gif,
+                                record::RecordFormat::Gif => record::RecordFormat::Mp4,
+                            };
+                            cx.notify();
+                        }
+                    }))
+                    .child(prep.format.as_str().to_uppercase()),
+            )
+            .child(
+                div()
+                    .id("rec-fps-btn")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(rgb(p.card))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(ref mut pr) = this.recording_prep {
+                            pr.fps = match pr.fps {
+                                15 => 30,
+                                30 => 60,
+                                _ => 15,
+                            };
+                            cx.notify();
+                        }
+                    }))
+                    .child(format!("{} fps", prep.fps)),
+            );
+
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(!self.long_capture, |el| {
+                el.child(
+                    div()
+                        .id("rec-cursor-btn")
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(rgb(if prep.show_cursor { p.selected } else { p.card }))
+                        .text_color(rgb(if prep.show_cursor {
+                            p.selected_text
+                        } else {
+                            p.muted
+                        }))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(ref mut pr) = this.recording_prep {
+                                pr.show_cursor = !pr.show_cursor;
+                                cx.notify();
+                            }
+                        }))
+                        .child(tr("rec.cursor")),
+                )
+            });
+        if !self.long_capture && prep.format == record::RecordFormat::Mp4 {
             actions = actions
                 .child(
                     div()
@@ -1059,14 +1200,32 @@ impl SelectView {
                     .rounded_sm()
                     .text_xs()
                     .cursor_pointer()
-                    .bg(rgb(0xC92A2A))
+                    .bg(rgb(accent))
                     .text_color(rgb(0xFFFFFF))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.start_recording_from_prep(window, cx);
+                        if this.long_capture {
+                            if let Some(prep) = this.recording_prep.take() {
+                                this.start_long(window, cx, prep.rect);
+                            }
+                        } else {
+                            this.start_recording_from_prep(window, cx);
+                        }
                     }))
-                    .child(tr("rec.start")),
+                    .child(tr(if self.long_capture {
+                        "long.start"
+                    } else {
+                        "rec.start"
+                    })),
             );
-        row2 = row2.child(actions);
+        let details = details.when(!self.long_capture, |el| el.child(options));
+        let row2 = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(details)
+            .child(actions);
 
         div()
             .id("rec-prep-bar")
@@ -1082,7 +1241,7 @@ impl SelectView {
             .text_color(rgb(p.text))
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_2()
             // 阻止点击控制条穿透到底层画布触发重新框选。
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(row1)
@@ -1189,9 +1348,61 @@ impl SelectView {
         cx.refresh_windows();
     }
 
-    /// 完成选择：裁剪首帧选区，交统一收尾（保存 / 复制 / 编辑窗 / 提示）后关闭本轮浮层。
+    /// 从冻结首帧裁出选区，关闭所有浮层后启动持续滚动拼接。
+    fn start_long(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        rect: (f32, f32, f32, f32),
+    ) {
+        if self.session.is_finished() {
+            window.remove_window();
+            return;
+        }
+        let (x, y, w, h) = rect;
+        let (sx, sy) = self.scale();
+        let cx0 = (x * sx).round().clamp(0.0, self.img_w as f32 - 1.0) as u32;
+        let cy0 = (y * sy).round().clamp(0.0, self.img_h as f32 - 1.0) as u32;
+        let cw = ((w * sx).round() as u32).clamp(1, self.img_w - cx0);
+        let ch = ((h * sy).round() as u32).clamp(1, self.img_h - cy0);
+        let initial = image::imageops::crop_imm(&*self.pixels, cx0, cy0, cw, ch).to_image();
+        cap_log(&format!(
+            "长截图选区确认：物理选区 ({cx0}, {cy0}, {cw}, {ch})，显示器 {:?}",
+            self.display_id
+        ));
+        let left = (self.origin_px.0 + cx0 as f32).round() as i32;
+        let top = (self.origin_px.1 + cy0 as f32).round() as i32;
+        let spec = longshot::LongSpec {
+            display_id: self.display_id,
+            display_bounds: self.display_bounds,
+            view_rect: rect,
+            crop_px: (cx0, cy0, cw, ch),
+            border_px: (left - 3, top - 3, cw as i32 + 6, ch as i32 + 6),
+            initial,
+        };
+        let main = self.main.clone();
+        self.session.finish(Some(self.index), cx);
+        window.remove_window();
+        main.clone().update(cx, |state, cx| {
+            state.set_status(&tr("long.capturing"), cx);
+            if let Err(error) = longshot::start(spec, main, cx) {
+                state.capturing = false;
+                let message = tr_fmt("long.failed", &[("error", &error)]);
+                state.set_status(&message, cx);
+                crate::toast::show(cx, message);
+            }
+        });
+        cx.refresh_windows();
+    }
+
+    /// 完成选择：长截图进入准备态，普通截图裁剪首帧后交统一收尾。
     fn finish(&mut self, window: &mut Window, cx: &mut Context<Self>, rect: (f32, f32, f32, f32)) {
-        self.finish_selection(window, cx, rect, false, false);
+        self.sync_long_mode();
+        if self.long_capture {
+            self.enter_long_prep(rect, cx);
+        } else {
+            self.finish_selection(window, cx, rect, false, false);
+        }
     }
 
     /// 按 B 键完成框选并强制打开标注编辑窗。
@@ -1361,7 +1572,8 @@ fn ocr_drag_rect(
 }
 
 impl Render for SelectView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_long_mode();
         // 薄遮罩：透出真实屏幕，用户能看清又能感知是截图态。
         let mask = rgba(0x00000059);
         let border_blue = rgb(0x0078D4);
@@ -1404,10 +1616,28 @@ impl Render for SelectView {
             }))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.sync_long_mode();
                 if ev.keystroke.key.as_str() == "escape" {
                     this.cancel(window, cx);
+                } else if this.recording_prep.is_none() && this.anchor.is_none() {
+                    // 框选功能键统一要求左键仍按住；尚未拖框时只允许 Esc 取消。
+                } else if this.long_capture && this.recording_prep.is_none() {
+                    // 长截图选区阶段只保留平移与全屏框选，其余截图动作继续走普通收尾会截错模式。
+                    if ev.keystroke.key.as_str() == "space" {
+                        this.space_held = true;
+                    } else if plain_key(&ev.keystroke, "f") {
+                        this.anchor = None;
+                        this.current = None;
+                        this.finish(window, cx, (0.0, 0.0, this.view_w, this.view_h));
+                    }
+                } else if this.recording_prep.is_none() && plain_key(&ev.keystroke, "l") {
+                    // L 只由当前拖框浮层接收，不注册全局热键。
+                    if let Some(rect) = this.sel_rect() {
+                        this.enter_long_prep(rect, cx);
+                        cx.refresh_windows();
+                    }
                 } else if this.recording_prep.is_some() {
-                    if ev.keystroke.key.as_str() == "enter" {
+                    if ev.keystroke.key.as_str() == "enter" && !this.long_capture {
                         this.start_recording_from_prep(window, cx);
                     } else if plain_key(&ev.keystroke, "f") {
                         // 录屏准备态下按 F 一键切到全屏录制范围。
@@ -1589,6 +1819,25 @@ impl Render for SelectView {
                     );
             }
         }
+        if self.long_capture {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px((self.view_w - 560.0).max(12.0) * 0.5))
+                    .top(px(18.0))
+                    .w(px(560.0_f32.min(self.view_w - 24.0).max(240.0)))
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(rgba(0x151A22E8))
+                    .border_1()
+                    .border_color(rgb(0x0078D4))
+                    .text_color(rgb(0xFFFFFF))
+                    .text_sm()
+                    .text_center()
+                    .child(tr("long.select_hint")),
+            );
+        }
         // 录屏准备态：在选区四角与四边中点绘制拖拽手柄，并在外侧展示控制条。
         if let Some(rect) = prep_rect {
             let (rx, ry, rw, rh) = rect;
@@ -1616,7 +1865,7 @@ impl Render for SelectView {
                         .border_color(rgb(0xE03131)),
                 );
             }
-            root = root.child(self.render_record_prep_bar(rect, cx));
+            root = root.child(self.render_capture_prep_bar(rect, window, cx));
         }
         // 提示点只加入渲染树，所有裁剪/取色/保存仍读取未修改的 self.pixels。
         if let Some(code) = self.selected_qr() {
@@ -1679,6 +1928,17 @@ mod tests {
     //! 浮层坐标换算单测：副屏原点偏移与跨屏裁剪（纯函数，不依赖窗口）。
 
     use super::*;
+
+    /// 全局 L 只切换当前会话，已结束的浮层不能再次接收请求。
+    #[test]
+    fn long_request_only_affects_active_overlay() {
+        let session = OverlaySession::new();
+        assert!(!session.long_requested.get());
+        assert!(session.request_long());
+        assert!(session.long_requested.get());
+        session.finished.set(true);
+        assert!(!session.request_long());
+    }
 
     /// 平移时尺寸不变，反向框选及碰到屏幕四边都不能挤压或移出选区。
     #[test]

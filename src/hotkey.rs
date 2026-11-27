@@ -10,7 +10,7 @@ use crate::{
     i18n::{tr, tr_fmt},
 };
 
-/// 截图热键种类：区域、全屏、取色各一个系统级全局热键。
+/// 截图热键种类：区域、全屏、取色使用全局热键，长截图仅在拖框时触发。
 ///（窗口吸附已合入区域截图，不再需要独立窗口热键。）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HotkeyKind {
@@ -20,15 +20,18 @@ pub enum HotkeyKind {
     Full,
     /// 屏幕取色。
     Picker,
+    /// 长截图。
+    Long,
 }
 
 impl HotkeyKind {
-    /// 系统注册编号（三种热键互不干扰）。
+    /// 系统注册编号（四种热键互不干扰）。
     pub fn id(self) -> u32 {
         match self {
             HotkeyKind::Region => 1,
             HotkeyKind::Full => 2,
             HotkeyKind::Picker => 3,
+            HotkeyKind::Long => 4,
         }
     }
 
@@ -36,6 +39,7 @@ impl HotkeyKind {
     pub fn default_text(self) -> &'static str {
         match self {
             HotkeyKind::Region => "insert",
+            HotkeyKind::Long => "",
             HotkeyKind::Full | HotkeyKind::Picker => "",
         }
     }
@@ -46,6 +50,7 @@ impl HotkeyKind {
             HotkeyKind::Region => tr("hotkey.region"),
             HotkeyKind::Full => tr("hotkey.full"),
             HotkeyKind::Picker => tr("hotkey.picker"),
+            HotkeyKind::Long => tr("hotkey.long"),
         }
     }
 }
@@ -83,6 +88,7 @@ pub fn load_hotkey_string(kind: HotkeyKind) -> String {
         HotkeyKind::Region => cfg.hotkeys.region,
         HotkeyKind::Full => cfg.hotkeys.full,
         HotkeyKind::Picker => cfg.hotkeys.picker,
+        HotkeyKind::Long => cfg.hotkeys.long,
     };
     resolve_hotkey(kind, stored)
 }
@@ -106,6 +112,7 @@ pub fn save_hotkey_string(kind: HotkeyKind, hotkey: &str) {
         HotkeyKind::Region => cfg.hotkeys.region = Some(hotkey.to_string()),
         HotkeyKind::Full => cfg.hotkeys.full = Some(hotkey.to_string()),
         HotkeyKind::Picker => cfg.hotkeys.picker = Some(hotkey.to_string()),
+        HotkeyKind::Long => cfg.hotkeys.long = Some(hotkey.to_string()),
     });
 }
 
@@ -119,7 +126,8 @@ pub fn save_hotkey_string(kind: HotkeyKind, hotkey: &str) {
 /// # 返回
 /// 注册成功返回 `Ok(())`；按键串非法或被系统占用时返回中文错误说明。
 pub fn apply_global_hotkey(cx: &mut App, kind: HotkeyKind, hotkey: &str) -> Result<(), String> {
-    if hotkey.trim().is_empty() {
+    // 长截图配置保留兼容旧文件，但绝不向系统注册，避免日常输入被截获。
+    if kind == HotkeyKind::Long || hotkey.trim().is_empty() {
         cx.unregister_global_hotkey(kind.id());
         return Ok(());
     }
@@ -155,6 +163,7 @@ mod tests {
         assert_eq!(resolve_hotkey(HotkeyKind::Region, None), "insert");
         assert_eq!(resolve_hotkey(HotkeyKind::Full, None), "");
         assert_eq!(resolve_hotkey(HotkeyKind::Picker, None), "");
+        assert_eq!(resolve_hotkey(HotkeyKind::Long, None), "");
         assert_eq!(resolve_hotkey(HotkeyKind::Region, Some("  ".into())), "");
         assert_eq!(
             resolve_hotkey(HotkeyKind::Full, Some("ctrl-alt-f".into())),
