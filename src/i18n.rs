@@ -966,6 +966,13 @@ fn builtin(lang: &Lang, key: &str) -> Option<&'static str> {
                 "Cancel"
             }
         }
+        "rec.cancelled" => {
+            if zh {
+                "录屏已取消"
+            } else {
+                "Recording cancelled"
+            }
+        }
         "rec.ratio_free" => {
             if zh {
                 "自由"

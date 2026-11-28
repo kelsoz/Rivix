@@ -42,6 +42,9 @@ url = "2.5"
 # 两者早已在 rgpui 的依赖树里，不引入额外下载体积。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# CLI 录屏直接复用 rgpui 已依赖的本地 scap-rs，按 HWND 捕获窗口并输出 BGRA 帧。
+# 当前 CLI 仅支持 Windows，关闭 scap 默认 Linux 后端，避免激活无关平台依赖。
+scap-rs = { path = "vendor/scap-rs", default-features = false }
 [features]
 # 调试面板透传：debug 构建默认启用检查器（F12）；
 # release 下默认剥离，如需保留用 `--features inspector` 显式开启。
@@ -91,8 +94,11 @@ windows = { version = "0.62", features = [
   "Win32_System_Pipes",
   "Win32_System_Registry",
   "Win32_System_Threading",
+  "Win32_UI_HiDpi",
   "Win32_UI_WindowsAndMessaging",
 ] }
+# CLI 窗口匹配需要 PID、进程名与完整 HWND；该 crate 已随 scap-rs 安装，不引入新包。
+windows-capture = "2.0"
 # 取原生窗口句柄（HWND）：rgpui 的 `Window` 只通过 raw-window-handle 标准 trait
 # 暴露原生句柄，保存提示胶囊要用它把自己排除出抓屏（SetWindowDisplayAffinity）。
 # rgpui 本身已经依赖同一版本（0.6.x），不新增任何下载体积。

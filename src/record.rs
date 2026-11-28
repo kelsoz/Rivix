@@ -62,6 +62,43 @@ impl RecordFormat {
     }
 }
 
+/// 命令行录屏目标（窗口标题/HWND、进程 PID/名称，或显示器物理像素区域）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CliRecordTarget {
+    /// 按窗口标题或十进制/十六进制 HWND 选择可见窗口。
+    Window(String),
+    /// 按进程 PID 或进程名（可省略 `.exe`）选择面积最大的窗口。
+    Process(String),
+    /// 虚拟屏幕物理像素区域 `(x, y, width, height)`，仅支持单显示器。
+    Region {
+        /// 左上角横坐标，可为负。
+        x: i32,
+        /// 左上角纵坐标，可为负。
+        y: i32,
+        /// 区域宽度。
+        w: u32,
+        /// 区域高度。
+        h: u32,
+    },
+}
+
+/// 一次命令行录屏请求。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CliRecordRequest {
+    /// 捕获目标。
+    pub target: CliRecordTarget,
+    /// 录制时长，必须大于零。
+    pub duration: Duration,
+    /// 输出格式。
+    pub format: RecordFormat,
+    /// MP4 平均视频码率（Mbps）。
+    pub bitrate_mbps: u32,
+    /// 捕获与编码帧率。
+    pub fps: u32,
+    /// 显式输出文件或目录；`None` 使用截图默认目录。
+    pub output: Option<PathBuf>,
+}
+
 /// 录屏选区比例预设。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AspectPreset {
@@ -203,6 +240,7 @@ pub struct RecordSpec {
 struct ActiveSession {
     stop_flag: Arc<AtomicBool>,
     paused_flag: Arc<AtomicBool>,
+    cancel_flag: Arc<AtomicBool>,
     hud_windows: Arc<Mutex<Vec<AnyWindowHandle>>>,
     border_window: Arc<Mutex<Option<BorderWindowHandle>>>,
 }
@@ -257,6 +295,18 @@ pub fn stop_active() -> bool {
     false
 }
 
+/// 请求取消当前录屏，停止编码并丢弃本次文件。
+pub fn cancel_active() -> bool {
+    if let Ok(guard) = active_slot().lock()
+        && let Some(session) = guard.as_ref()
+    {
+        session.cancel_flag.store(true, Ordering::SeqCst);
+        session.stop_flag.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
 /// 关闭全部录屏 HUD 窗口并清空全局会话占位。
 fn cleanup_session(cx: &mut App) {
     let (handles, border) = if let Ok(mut guard) = active_slot().lock() {
@@ -281,6 +331,15 @@ fn cleanup_session(cx: &mut App) {
     cx.unregister_global_hotkey(STOP_HOTKEY_SHIFT_ESC_ID);
     tray::refresh_labels(cx);
     cx.refresh_windows();
+}
+
+/// 取消录屏：关闭控制条、删除本次文件并只提示取消状态。
+fn finish_cancelled(main: &rgpui::Entity<RivixApp>, out_path: &Path, cx: &mut App) {
+    cleanup_session(cx);
+    let _ = std::fs::remove_file(out_path);
+    let msg = tr("rec.cancelled");
+    main.update(cx, |state, cx| state.set_status(&msg, cx));
+    toast::show(cx, msg);
 }
 
 /// 查找可用的 `ffmpeg` 可执行文件：同目录优先，其次 PATH 与常见本机位置。
@@ -370,6 +429,7 @@ pub fn start_recording(
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let paused_flag = Arc::new(AtomicBool::new(false));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
     let elapsed_ms = Arc::new(AtomicU64::new(0));
     let hud_windows = Arc::new(Mutex::new(Vec::new()));
     let border_window = Arc::new(Mutex::new(None));
@@ -379,6 +439,7 @@ pub fn start_recording(
         *guard = Some(ActiveSession {
             stop_flag: stop_flag.clone(),
             paused_flag: paused_flag.clone(),
+            cancel_flag: cancel_flag.clone(),
             hud_windows: hud_windows.clone(),
             border_window: border_window.clone(),
         });
@@ -407,6 +468,7 @@ pub fn start_recording(
 
     let stop_for_bg = stop_flag.clone();
     let paused_for_bg = paused_flag.clone();
+    let cancel_for_bg = cancel_flag.clone();
     let elapsed_for_bg = elapsed_ms.clone();
     let out_for_bg = out_path.clone();
     let spec_for_bg = spec.clone();
@@ -416,6 +478,10 @@ pub fn start_recording(
             Ok(Ok(list)) if !list.is_empty() => list,
             _ => {
                 cx.update(|cx| {
+                    if cancel_for_bg.load(Ordering::Relaxed) {
+                        finish_cancelled(&main, &out_for_bg, cx);
+                        return;
+                    }
                     cleanup_session(cx);
                     let msg = tr("cap.no_source");
                     main.update(cx, |state, cx| state.set_status(&msg, cx));
@@ -424,6 +490,11 @@ pub fn start_recording(
                 return;
             }
         };
+
+        if cancel_for_bg.load(Ordering::Relaxed) {
+            cx.update(|cx| finish_cancelled(&main, &out_for_bg, cx));
+            return;
+        }
 
         let source = pick_source_for_display(&sources, spec_for_bg.display_id, primary_display_id);
         let callback: Box<dyn Fn(rgpui::ScreenCaptureFrame) + Send> =
@@ -453,6 +524,10 @@ pub fn start_recording(
             Ok(Ok(s)) => s,
             _ => {
                 cx.update(|cx| {
+                    if cancel_for_bg.load(Ordering::Relaxed) {
+                        finish_cancelled(&main, &out_for_bg, cx);
+                        return;
+                    }
                     cleanup_session(cx);
                     let msg = tr_fmt("rec.failed", &[("msg", "stream start failed")]);
                     main.update(cx, |state, cx| state.set_status(&msg, cx));
@@ -464,13 +539,14 @@ pub fn start_recording(
 
         // 保持 stream 在录制生命周期内存活，直到外部请求停止。
         let _keep_stream = stream;
+        let out_for_pipeline = out_for_bg.clone();
         let result = cx
             .background_executor()
             .spawn(async move {
                 run_ffmpeg_pipeline(
                     &ffmpeg_path,
                     &spec_for_bg,
-                    &out_for_bg,
+                    &out_for_pipeline,
                     frame_rx,
                     &stop_for_bg,
                     &paused_for_bg,
@@ -481,6 +557,10 @@ pub fn start_recording(
 
         drop(_keep_stream);
         cx.update(|cx| {
+            if cancel_for_bg.load(Ordering::Relaxed) {
+                finish_cancelled(&main, &out_for_bg, cx);
+                return;
+            }
             cleanup_session(cx);
             match result {
                 Ok(_saved_path) => {
@@ -779,6 +859,967 @@ fn run_ffmpeg_pipeline(
         });
     }
     Ok(out_path.to_path_buf())
+}
+
+/// Windows 命令行录屏实现：真实窗口/显示器 WGC 帧经 stdin 交给 FFmpeg。
+#[cfg(target_os = "windows")]
+mod cli_recording {
+    use super::*;
+    use scap_rs::{
+        Display as ScapDisplay, Target, Window as ScapWindow,
+        capturer::{Area, Capturer, Options, Point, Resolution, Size},
+        frame::{BGRAFrame, Frame, FrameType, RGBxFrame},
+    };
+    use std::{
+        ffi::c_void,
+        panic::{AssertUnwindSafe, catch_unwind},
+        process::{ChildStdin, Stdio},
+        thread::JoinHandle,
+    };
+    use windows::Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::{
+            Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
+            Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO},
+        },
+        System::Threading::GetCurrentProcessId,
+        UI::{
+            HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
+            WindowsAndMessaging::IsIconic,
+        },
+    };
+    use windows_capture::{monitor::Monitor, window::Window as CaptureWindow};
+
+    /// 已解析的捕获目标与固定裁剪区。
+    struct CapturePlan {
+        /// scap 捕获目标。
+        target: Target,
+        /// 逻辑像素裁剪区；vendor 会按显示器 DPI 转回物理像素。
+        crop: Area,
+        /// 命令行展示用目标说明。
+        label: String,
+    }
+
+    /// 显示器物理矩形与对应 scap 目标。
+    #[derive(Clone, Debug)]
+    struct MonitorInfo {
+        /// 显示器矩形 `(left, top, right, bottom)`。
+        rect: RECT,
+        /// 显示器捕获目标。
+        target: Target,
+    }
+
+    /// 窗口候选及其排序信息。
+    #[derive(Clone, Debug)]
+    struct WindowCandidate {
+        /// 完整 HWND 对应的窗口对象。
+        window: CaptureWindow,
+        /// 窗口标题。
+        title: String,
+        /// 所属进程 PID。
+        pid: u32,
+        /// 进程映像名，读取失败时为空。
+        process: String,
+        /// 可见窗口面积。
+        area: i64,
+    }
+
+    /// 裁剪后的物理像素区域。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct PhysicalRegion {
+        /// 左上角横坐标。
+        x: i32,
+        /// 左上角纵坐标。
+        y: i32,
+        /// 偶数宽度。
+        w: u32,
+        /// 偶数高度。
+        h: u32,
+    }
+
+    /// 执行一次固定时长的命令行录屏，返回实际保存路径。
+    pub(crate) fn run_cli_recording(request: &CliRecordRequest) -> Result<PathBuf, String> {
+        let out_path = recording_output_path(request)?;
+        let Some(ffmpeg) = find_ffmpeg() else {
+            return Err("未找到 ffmpeg.exe（请将其放到 rivix.exe 同目录或系统 PATH）".to_string());
+        };
+        let plan = resolve_target(&request.target)?;
+        println!("录屏目标：{}", plan.label);
+
+        let mut capturer = Capturer::build(Options {
+            fps: request.fps,
+            show_cursor: false,
+            show_highlight: false,
+            target: Some(plan.target.clone()),
+            crop_area: Some(plan.crop.clone()),
+            output_type: FrameType::BGRAFrame,
+            output_resolution: Resolution::Captured,
+            excluded_targets: None,
+        })
+        .map_err(|error| format!("创建屏幕捕获器失败：{error}"))?;
+        let [width, height] = capturer.get_output_frame_size();
+        if width < 2 || height < 2 {
+            return Err("目标尺寸过小，无法录屏".to_string());
+        }
+
+        let (mut child, mut stdin, stderr_handle) =
+            spawn_encoder(&ffmpeg, request, width, height, &out_path)?;
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<Result<Vec<u8>, String>>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_stop = stop.clone();
+        let capture_width = width as i32;
+        let capture_height = height as i32;
+        // 捕获回调不能阻塞 FFmpeg 写入，故独立线程取帧；主线程只负责计时与编码。
+        std::thread::spawn(move || {
+            let started = catch_unwind(AssertUnwindSafe(|| capturer.start_capture()));
+            if started.is_err() {
+                let _ = frame_tx.send(Err("启动屏幕捕获失败（目标可能不支持 WGC）".to_string()));
+                return;
+            }
+            while !capture_stop.load(Ordering::Relaxed) {
+                let frame = match capturer.get_next_frame() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = frame_tx.send(Err(format!("读取屏幕帧失败：{error}")));
+                        break;
+                    }
+                };
+                let data = match frame_to_bgra(frame, capture_width, capture_height) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        let _ = frame_tx.send(Err(error));
+                        break;
+                    }
+                };
+                if frame_tx.send(Ok(data)).is_err() {
+                    break;
+                }
+            }
+            // start_capture 成功后 capture_control 才存在；捕获意外关闭时停止仍安全。
+            let _ = catch_unwind(AssertUnwindSafe(|| capturer.stop_capture()));
+        });
+
+        let (written_frames, capture_error) =
+            pump_frames(frame_rx, &mut stdin, request.duration, request.fps);
+
+        stop.store(true, Ordering::SeqCst);
+        drop(stdin);
+        let wait_result = child.wait();
+        let stderr_text = stderr_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+
+        if written_frames == 0 {
+            if std::fs::metadata(&out_path).is_ok_and(|meta| meta.len() < 1024) {
+                let _ = std::fs::remove_file(&out_path);
+            }
+            return Err(capture_error.unwrap_or_else(|| "未捕获到视频帧".to_string()));
+        }
+        if let Some(error) = capture_error {
+            return Err(format!("{error}；已保留 {}", out_path.display()));
+        }
+        let status = wait_result.map_err(|error| format!("等待 FFmpeg 退出失败：{error}"))?;
+        if !status.success() {
+            let tail = stderr_text
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let error = if tail.is_empty() {
+                format!("FFmpeg 异常退出：{status}")
+            } else {
+                tail
+            };
+            return Err(format!("{error}；已保留 {}", out_path.display()));
+        }
+        Ok(out_path)
+    }
+
+    /// 按目标帧率输送帧；WGC 静止时只产出首帧，因此没有新帧也要重复最后一帧。
+    fn pump_frames<W: std::io::Write>(
+        frame_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+        writer: &mut W,
+        duration: Duration,
+        fps: u32,
+    ) -> (u64, Option<String>) {
+        let fps = fps.max(1);
+        let interval = Duration::from_secs_f64(1.0 / fps as f64);
+        // 输出时长由帧数决定，避免写入耗时或帧到达抖动让成品少几帧。
+        let target_frames = (duration.as_nanos() * fps as u128)
+            .div_ceil(1_000_000_000)
+            .min(u64::MAX as u128) as u64;
+        if target_frames == 0 {
+            return (0, None);
+        }
+
+        let first = match frame_rx.recv_timeout(duration) {
+            Ok(Ok(data)) => data,
+            Ok(Err(error)) => return (0, Some(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => return (0, None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return (
+                    0,
+                    Some("屏幕捕获流意外关闭（目标窗口可能已关闭）".to_string()),
+                );
+            }
+        };
+        let mut last_frame = Some(first);
+        let mut next_frame_at = Instant::now();
+        let mut written_frames = 0u64;
+
+        while written_frames < target_frames {
+            let now = Instant::now();
+            if now >= next_frame_at {
+                let Some(frame) = last_frame.as_ref() else {
+                    break;
+                };
+                if let Err(error) = writer.write_all(frame) {
+                    return (written_frames, Some(format!("写入 FFmpeg 失败：{error}")));
+                }
+                written_frames += 1;
+                next_frame_at = now + interval;
+                continue;
+            }
+            match frame_rx.recv_timeout(next_frame_at.saturating_duration_since(now)) {
+                Ok(Ok(data)) => last_frame = Some(data),
+                Ok(Err(error)) => return (written_frames, Some(error)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return (
+                        written_frames,
+                        Some("屏幕捕获流意外关闭（目标窗口可能已关闭）".to_string()),
+                    );
+                }
+            }
+        }
+        (written_frames, None)
+    }
+
+    /// 解析目标并固定裁剪尺寸；窗口按完整客户画面，区域按单显示器交集。
+    fn resolve_target(target: &CliRecordTarget) -> Result<CapturePlan, String> {
+        match target {
+            CliRecordTarget::Window(query) => resolve_window_target(query),
+            CliRecordTarget::Process(query) => resolve_process_target(query),
+            CliRecordTarget::Region { x, y, w, h } => resolve_region_target(PhysicalRegion {
+                x: *x,
+                y: *y,
+                w: *w,
+                h: *h,
+            }),
+        }
+    }
+
+    /// 按 HWND 或标题匹配窗口；标题优先精确匹配，其次子串，多个结果取面积最大。
+    fn resolve_window_target(query: &str) -> Result<CapturePlan, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("窗口标题或 HWND 不能为空".to_string());
+        }
+        if let Some(hwnd) = parse_hwnd(query) {
+            let window = CaptureWindow::from_raw_hwnd(hwnd as *mut c_void);
+            let candidate = window_candidate(window)
+                .ok_or_else(|| "指定窗口不存在、不可见、已最小化或不可捕获".to_string())?;
+            return window_plan(candidate);
+        }
+
+        let candidates = window_candidates()?;
+        let index =
+            select_window(&candidates, query).ok_or_else(|| format!("未找到可见窗口：{query}"))?;
+        window_plan(candidates[index].clone())
+    }
+
+    /// 按 PID 或进程名匹配；多个可见窗口取面积最大。
+    fn resolve_process_target(query: &str) -> Result<CapturePlan, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("进程 PID 或名称不能为空".to_string());
+        }
+        let candidates = window_candidates()?;
+        let pid = query.parse::<u32>().ok();
+        let mut best: Option<WindowCandidate> = None;
+        for candidate in candidates {
+            let matches = match pid {
+                Some(pid) => candidate.pid == pid,
+                None => process_matches(query, &candidate.process),
+            };
+            if matches
+                && best
+                    .as_ref()
+                    .is_none_or(|current| candidate.area > current.area)
+            {
+                best = Some(candidate);
+            }
+        }
+        let candidate = best.ok_or_else(|| format!("未找到带可见窗口的进程：{query}"))?;
+        window_plan(candidate)
+    }
+
+    /// 将物理区域定位到唯一相交显示器，并转换为 scap 的逻辑像素裁剪区。
+    fn resolve_region_target(region: PhysicalRegion) -> Result<CapturePlan, String> {
+        let monitors = Monitor::enumerate().map_err(|error| format!("枚举显示器失败：{error}"))?;
+        if monitors.is_empty() {
+            return Err("未找到可用显示器".to_string());
+        }
+        let mut infos = Vec::with_capacity(monitors.len());
+        for monitor in monitors {
+            let raw = monitor.as_raw_hmonitor();
+            let Some(rect) = monitor_rect(raw) else {
+                continue;
+            };
+            let width = (rect.right - rect.left) as u32;
+            let height = (rect.bottom - rect.top) as u32;
+            let Ok(width) = u16::try_from(width) else {
+                return Err("显示器宽度超出捕获接口范围".to_string());
+            };
+            let Ok(height) = u16::try_from(height) else {
+                return Err("显示器高度超出捕获接口范围".to_string());
+            };
+            let title = monitor
+                .name()
+                .unwrap_or_else(|_| format!("显示器 {}", raw as usize));
+            infos.push(MonitorInfo {
+                rect,
+                target: Target::Display(ScapDisplay {
+                    id: raw as u32,
+                    title,
+                    raw_handle: HMONITOR(raw),
+                    width,
+                    height,
+                }),
+            });
+        }
+        let (index, clipped) = select_monitor_region(region, &infos)?;
+        let monitor = &infos[index];
+        let scale = monitor_scale(monitor.target.clone());
+        let label = format!(
+            "区域 {},{},{},{}（{}）",
+            clipped.x,
+            clipped.y,
+            clipped.w,
+            clipped.h,
+            display_title(&monitor.target)
+        );
+        Ok(CapturePlan {
+            target: monitor.target.clone(),
+            crop: Area {
+                origin: Point {
+                    x: (clipped.x - monitor.rect.left) as f64 / scale,
+                    y: (clipped.y - monitor.rect.top) as f64 / scale,
+                },
+                size: Size {
+                    width: clipped.w as f64 / scale,
+                    height: clipped.h as f64 / scale,
+                },
+            },
+            label,
+        })
+    }
+
+    /// 枚举可见、未最小化、未遮蔽且不属于自身的窗口。
+    fn window_candidates() -> Result<Vec<WindowCandidate>, String> {
+        let candidates = CaptureWindow::enumerate()
+            .map_err(|error| format!("枚举窗口失败：{error}"))?
+            .into_iter()
+            .filter_map(window_candidate)
+            .collect();
+        Ok(candidates)
+    }
+
+    /// 筛选单个窗口并补充 PID、进程名与面积。
+    fn window_candidate(window: CaptureWindow) -> Option<WindowCandidate> {
+        if !window.is_valid() {
+            return None;
+        }
+        let hwnd = HWND(window.as_raw_hwnd());
+        if unsafe { IsIconic(hwnd) }.as_bool() || is_cloaked(hwnd) {
+            return None;
+        }
+        let pid = window.process_id().ok()?;
+        if pid == unsafe { GetCurrentProcessId() } {
+            return None;
+        }
+        let rect = window.rect().ok()?;
+        let title = window.title().unwrap_or_default();
+        if title.trim().is_empty() {
+            return None;
+        }
+        let area = (rect.right as i64 - rect.left as i64)
+            .max(0)
+            .saturating_mul((rect.bottom as i64 - rect.top as i64).max(0));
+        if area < 60 * 60 {
+            return None;
+        }
+        Some(WindowCandidate {
+            title,
+            process: window.process_name().unwrap_or_default(),
+            window,
+            pid,
+            area,
+        })
+    }
+
+    /// 为选中窗口构造完整画面裁剪区，并将奇数宽高向下对齐到偶数。
+    fn window_plan(candidate: WindowCandidate) -> Result<CapturePlan, String> {
+        let rect = candidate
+            .window
+            .rect()
+            .map_err(|error| format!("读取窗口矩形失败：{error}"))?;
+        let width = (rect.right - rect.left).max(2) & !1;
+        let height = (rect.bottom - rect.top).max(2) & !1;
+        let scale = window_scale(candidate.window.as_raw_hwnd());
+        let process = if candidate.process.is_empty() {
+            String::new()
+        } else {
+            format!("，{}", candidate.process)
+        };
+        let label = format!(
+            "{}（PID {}{process}，{}x{}）",
+            if candidate.title.is_empty() {
+                "<无标题窗口>"
+            } else {
+                &candidate.title
+            },
+            candidate.pid,
+            width,
+            height
+        );
+        Ok(CapturePlan {
+            target: Target::Window(ScapWindow {
+                id: candidate.window.as_raw_hwnd() as u32,
+                title: candidate.title,
+                raw_handle: HWND(candidate.window.as_raw_hwnd()),
+            }),
+            crop: Area {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: width as f64 / scale,
+                    height: height as f64 / scale,
+                },
+            },
+            label,
+        })
+    }
+
+    /// 启动 FFmpeg 原始 BGRA 管道并单独收集错误输出，避免 stderr 缓冲区写满。
+    fn spawn_encoder(
+        ffmpeg: &Path,
+        request: &CliRecordRequest,
+        width: u32,
+        height: u32,
+        out_path: &Path,
+    ) -> Result<(Child, ChildStdin, Option<JoinHandle<String>>), String> {
+        let mut cmd = hidden_command(ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-n"])
+            .args(["-f", "rawvideo"])
+            .args(["-pixel_format", "bgra"])
+            .args(["-video_size", &format!("{width}x{height}")])
+            .args(["-framerate", &request.fps.to_string()])
+            .args(["-i", "pipe:0"])
+            .arg("-an");
+        match request.format {
+            RecordFormat::Mp4 => {
+                cmd.args(["-c:v", "libx264", "-preset", "veryfast"])
+                    .args(["-b:v", &format!("{}M", request.bitrate_mbps)])
+                    .args(["-pix_fmt", "yuv420p"])
+                    // 分段写入 moov，Ctrl+C 等异常退出时已录片段仍可播放。
+                    .args(["-movflags", "+frag_keyframe+empty_moov+default_base_moof"]);
+            }
+            RecordFormat::Gif => {
+                cmd.args([
+                    "-vf",
+                    "split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer",
+                    "-loop",
+                    "0",
+                ]);
+            }
+        }
+        let mut child = cmd
+            .arg(out_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("启动 FFmpeg 失败：{error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "无法打开 FFmpeg 标准输入".to_string())?;
+        let stderr_handle = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = stderr.read_to_string(&mut text);
+                text
+            })
+        });
+        Ok((child, stdin, stderr_handle))
+    }
+
+    /// 将 scap 帧统一为无 padding 的 BGRA，并校验录制期间尺寸未变化。
+    fn frame_to_bgra(frame: Frame, width: i32, height: i32) -> Result<Vec<u8>, String> {
+        let data = match frame {
+            Frame::BGRA(BGRAFrame {
+                width: frame_width,
+                height: frame_height,
+                data,
+                ..
+            }) => {
+                validate_frame_size(frame_width, frame_height, data.len(), width, height)?;
+                data
+            }
+            Frame::RGBx(RGBxFrame {
+                width: frame_width,
+                height: frame_height,
+                mut data,
+                ..
+            }) => {
+                validate_frame_size(frame_width, frame_height, data.len(), width, height)?;
+                // vendor 对 Rgba8 源仍返回 RGBx，这里补回 FFmpeg 需要的 BGR 顺序。
+                let (pixels, _) = data.as_chunks_mut::<4>();
+                for pixel in pixels {
+                    pixel.swap(0, 2);
+                }
+                data
+            }
+            _ => return Err("屏幕捕获器返回了不支持的帧格式".to_string()),
+        };
+        if data.len() != width as usize * height as usize * 4 {
+            return Err("视频帧大小与编码尺寸不一致".to_string());
+        }
+        Ok(data)
+    }
+
+    /// 校验帧尺寸；窗口缩放后固定裁剪已失效，明确报错比写入错位像素安全。
+    fn validate_frame_size(
+        frame_width: i32,
+        frame_height: i32,
+        data_len: usize,
+        width: i32,
+        height: i32,
+    ) -> Result<(), String> {
+        if frame_width != width || frame_height != height {
+            return Err("录制期间目标尺寸发生变化，请固定窗口大小后重试".to_string());
+        }
+        if data_len != width as usize * height as usize * 4 {
+            return Err("视频帧大小与编码尺寸不一致".to_string());
+        }
+        Ok(())
+    }
+
+    /// 生成 CLI 录屏输出路径；与截图一致，显式目录自动补文件名，但绝不覆盖旧文件。
+    fn recording_output_path(request: &CliRecordRequest) -> Result<PathBuf, String> {
+        let mut path = match request.output.as_deref() {
+            Some(dir) if dir.is_dir() => dir.join(recording_name(request.format)),
+            Some(file) => file.to_path_buf(),
+            None => load_save_dir().join(recording_name(request.format)),
+        };
+        if path.extension().is_none() {
+            path.set_extension(request.format.as_str());
+        }
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| !extension.eq_ignore_ascii_case(request.format.as_str()))
+        {
+            return Err(format!(
+                "输出扩展名与 --format {} 不一致",
+                request.format.as_str()
+            ));
+        }
+        if path.exists() {
+            return Err(format!("输出文件已存在：{}", path.display()));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建输出目录失败（{}）：{error}", parent.display()))?;
+        }
+        Ok(path)
+    }
+
+    /// 生成默认录屏文件名。
+    fn recording_name(format: RecordFormat) -> String {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        format!("rivix-{millis}.{}", format.as_str())
+    }
+
+    /// 读取显示器物理矩形。
+    fn monitor_rect(raw: *mut c_void) -> Option<RECT> {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..MONITORINFO::default()
+        };
+        if !unsafe { GetMonitorInfoW(HMONITOR(raw), (&raw mut info).cast()) }.as_bool() {
+            return None;
+        }
+        Some(info.rcMonitor)
+    }
+
+    /// 读取显示器水平 DPI 缩放比。
+    fn monitor_scale(target: Target) -> f64 {
+        let Target::Display(display) = target else {
+            return 1.0;
+        };
+        let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+        let ok = unsafe {
+            GetDpiForMonitor(
+                display.raw_handle,
+                MDT_EFFECTIVE_DPI,
+                &mut dpi_x,
+                &mut dpi_y,
+            )
+            .is_ok()
+        };
+        if ok && dpi_x > 0 {
+            dpi_x as f64 / 96.0
+        } else {
+            1.0
+        }
+    }
+
+    /// 读取窗口水平 DPI 缩放比。
+    fn window_scale(raw: *mut c_void) -> f64 {
+        let dpi = unsafe { GetDpiForWindow(HWND(raw)) };
+        if dpi > 0 { dpi as f64 / 96.0 } else { 1.0 }
+    }
+
+    /// 判断窗口是否被 DWM 遮蔽。
+    fn is_cloaked(hwnd: HWND) -> bool {
+        let mut cloaked = 0u32;
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        }
+        .is_ok_and(|()| cloaked != 0)
+    }
+
+    /// 选择唯一相交显示器并裁剪越界部分；跨屏区域直接报错。
+    fn select_monitor_region(
+        region: PhysicalRegion,
+        monitors: &[MonitorInfo],
+    ) -> Result<(usize, PhysicalRegion), String> {
+        let mut matches = Vec::new();
+        for (index, monitor) in monitors.iter().enumerate() {
+            let rect = monitor.rect;
+            let x0 = (region.x as i64).max(rect.left as i64);
+            let y0 = (region.y as i64).max(rect.top as i64);
+            let x1 = (region.x as i64 + region.w as i64).min(rect.right as i64);
+            let y1 = (region.y as i64 + region.h as i64).min(rect.bottom as i64);
+            if x1 > x0 && y1 > y0 {
+                matches.push((index, x0, y0, x1, y1));
+            }
+        }
+        if matches.is_empty() {
+            return Err("区域与任何显示器均无交集".to_string());
+        }
+        if matches.len() > 1 {
+            return Err("区域跨越多个显示器，命令行录屏仅支持单显示器区域".to_string());
+        }
+        let (index, x0, y0, x1, y1) = matches[0];
+        let w = u32::try_from(x1 - x0).map_err(|_| "区域宽度无效".to_string())? & !1;
+        let h = u32::try_from(y1 - y0).map_err(|_| "区域高度无效".to_string())? & !1;
+        if w < 2 || h < 2 {
+            return Err("裁剪后的区域至少需要 2x2 物理像素".to_string());
+        }
+        Ok((
+            index,
+            PhysicalRegion {
+                x: x0 as i32,
+                y: y0 as i32,
+                w,
+                h,
+            },
+        ))
+    }
+
+    /// 标题匹配：精确优先于子串，同级按面积取最大。
+    fn select_window(candidates: &[WindowCandidate], query: &str) -> Option<usize> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return None;
+        }
+        let mut best: Option<(usize, bool)> = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            let title = candidate.title.to_lowercase();
+            let exact = title == query;
+            if !exact && !title.contains(&query) {
+                continue;
+            }
+            let replace = best.is_none_or(|(best_index, best_exact)| {
+                (exact && !best_exact)
+                    || (exact == best_exact && candidate.area > candidates[best_index].area)
+            });
+            if replace {
+                best = Some((index, exact));
+            }
+        }
+        best.map(|(index, _)| index)
+    }
+
+    /// 进程名匹配允许省略 `.exe`，忽略大小写。
+    fn process_matches(query: &str, process: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        let process = process.trim().to_lowercase();
+        if query.is_empty() || process.is_empty() {
+            return false;
+        }
+        let query_stem = query.strip_suffix(".exe").unwrap_or(&query);
+        let process_stem = process.strip_suffix(".exe").unwrap_or(&process);
+        query_stem == process_stem
+    }
+
+    /// 解析十进制或 `0x` 前缀的 HWND。
+    fn parse_hwnd(value: &str) -> Option<isize> {
+        if let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).ok()?.try_into().ok()
+        } else {
+            value.parse().ok()
+        }
+    }
+
+    /// 获取显示器展示名。
+    fn display_title(target: &Target) -> String {
+        match target {
+            Target::Display(display) => display.title.clone(),
+            Target::Window(window) => window.title.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 构造不访问系统的窗口候选，供匹配逻辑单测。
+        fn candidate(title: &str, process: &str, pid: u32, area: i64) -> WindowCandidate {
+            WindowCandidate {
+                window: CaptureWindow::from_raw_hwnd(std::ptr::null_mut()),
+                title: title.to_string(),
+                process: process.to_string(),
+                pid,
+                area,
+            }
+        }
+
+        /// 静止画面只有一帧时，仍按目标帧率补齐到请求时长。
+        #[test]
+        fn static_frame_is_repeated_for_requested_duration() {
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(Ok(vec![7; 8])).expect("发送首帧");
+            let mut output = Vec::new();
+            let started = Instant::now();
+            let (frames, error) = pump_frames(rx, &mut output, Duration::from_millis(200), 20);
+            drop(tx);
+
+            assert!(error.is_none(), "静止帧补齐不应报错：{error:?}");
+            assert_eq!(frames, 4, "200ms / 20fps 应恰好写出 4 帧");
+            assert_eq!(output.len(), frames as usize * 8);
+            assert!(output.iter().all(|byte| *byte == 7));
+            assert!(started.elapsed() >= Duration::from_millis(140));
+        }
+
+        /// 精确标题必须胜过面积更大的子串匹配，子串内部再按面积选择。
+        #[test]
+        fn window_match_prefers_exact_then_area() {
+            let candidates = vec![
+                candidate("Notes - Large", "notepad.exe", 10, 900),
+                candidate("Notes", "notepad.exe", 10, 100),
+                candidate("Other", "other.exe", 11, 1000),
+            ];
+            assert_eq!(select_window(&candidates, "notes"), Some(1));
+            assert_eq!(select_window(&candidates, "note"), Some(0));
+            assert_eq!(select_window(&candidates, "missing"), None);
+        }
+
+        /// 进程名忽略大小写与 `.exe` 后缀。
+        #[test]
+        fn process_name_match_accepts_stem() {
+            assert!(process_matches("Code", "Code.exe"));
+            assert!(process_matches("CODE.EXE", "code.exe"));
+            assert!(!process_matches("Code", "CodeInsiders.exe"));
+            assert!(!process_matches("", "Code.exe"));
+        }
+
+        /// 负坐标区域可落在左侧显示器，越界部分按交集钳制并对齐偶数。
+        #[test]
+        fn region_uses_negative_monitor_origin() {
+            let monitors = vec![
+                MonitorInfo {
+                    rect: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1920,
+                        bottom: 1080,
+                    },
+                    target: Target::Display(ScapDisplay {
+                        id: 1,
+                        title: "主屏".to_string(),
+                        raw_handle: HMONITOR(std::ptr::null_mut()),
+                        width: 1920,
+                        height: 1080,
+                    }),
+                },
+                MonitorInfo {
+                    rect: RECT {
+                        left: -1280,
+                        top: 0,
+                        right: 0,
+                        bottom: 1024,
+                    },
+                    target: Target::Display(ScapDisplay {
+                        id: 2,
+                        title: "左屏".to_string(),
+                        raw_handle: HMONITOR(std::ptr::null_mut()),
+                        width: 1280,
+                        height: 1024,
+                    }),
+                },
+            ];
+            let (index, clipped) = select_monitor_region(
+                PhysicalRegion {
+                    x: -1300,
+                    y: 10,
+                    w: 101,
+                    h: 51,
+                },
+                &monitors,
+            )
+            .expect("负坐标区域应命中左屏");
+            assert_eq!(index, 1);
+            assert_eq!(
+                clipped,
+                PhysicalRegion {
+                    x: -1280,
+                    y: 10,
+                    w: 80,
+                    h: 50,
+                }
+            );
+        }
+
+        /// 跨屏与完全屏外区域必须拒绝，避免静默漏录。
+        #[test]
+        fn region_rejects_cross_monitor_and_offscreen() {
+            let monitors = vec![MonitorInfo {
+                rect: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 100,
+                },
+                target: Target::Display(ScapDisplay {
+                    id: 1,
+                    title: "测试屏".to_string(),
+                    raw_handle: HMONITOR(std::ptr::null_mut()),
+                    width: 100,
+                    height: 100,
+                }),
+            }];
+            assert!(
+                select_monitor_region(
+                    PhysicalRegion {
+                        x: 200,
+                        y: 0,
+                        w: 10,
+                        h: 10,
+                    },
+                    &monitors,
+                )
+                .is_err()
+            );
+            let mut cross = monitors.clone();
+            cross.push(MonitorInfo {
+                rect: RECT {
+                    left: 100,
+                    top: 0,
+                    right: 200,
+                    bottom: 100,
+                },
+                target: Target::Display(ScapDisplay {
+                    id: 2,
+                    title: "右屏".to_string(),
+                    raw_handle: HMONITOR(std::ptr::null_mut()),
+                    width: 100,
+                    height: 100,
+                }),
+            });
+            assert!(
+                select_monitor_region(
+                    PhysicalRegion {
+                        x: 50,
+                        y: 0,
+                        w: 100,
+                        h: 10,
+                    },
+                    &cross,
+                )
+                .is_err()
+            );
+        }
+
+        /// HWND 支持十进制与十六进制。
+        #[test]
+        fn hwnd_parses_decimal_and_hex() {
+            assert_eq!(parse_hwnd("4660"), Some(4660));
+            assert_eq!(parse_hwnd("0x1234"), Some(0x1234));
+            assert_eq!(parse_hwnd("not-a-handle"), None);
+        }
+
+        /// BGRA 原样传递，RGBx 交换红蓝通道，尺寸不符则拒绝。
+        #[test]
+        fn frame_conversion_validates_and_swaps_rgbx() {
+            let bgra = Frame::BGRA(BGRAFrame {
+                display_time: 0,
+                width: 1,
+                height: 1,
+                data: vec![1, 2, 3, 255],
+            });
+            assert_eq!(
+                frame_to_bgra(bgra, 1, 1).expect("合法 BGRA"),
+                vec![1, 2, 3, 255]
+            );
+            let rgbx = Frame::RGBx(RGBxFrame {
+                display_time: 0,
+                width: 1,
+                height: 1,
+                data: vec![3, 2, 1, 255],
+            });
+            assert_eq!(
+                frame_to_bgra(rgbx, 1, 1).expect("合法 RGBx"),
+                vec![1, 2, 3, 255]
+            );
+            let wrong = Frame::BGRA(BGRAFrame {
+                display_time: 0,
+                width: 2,
+                height: 1,
+                data: vec![0; 8],
+            });
+            assert!(frame_to_bgra(wrong, 1, 1).is_err());
+        }
+    }
+}
+
+/// Windows 命令行录屏入口。
+#[cfg(target_os = "windows")]
+pub(crate) use cli_recording::run_cli_recording;
+
+/// 非 Windows 平台明确报错，避免解析成功后静默退出。
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn run_cli_recording(_request: &CliRecordRequest) -> Result<PathBuf, String> {
+    Err("当前平台暂不支持命令行录屏".to_string())
 }
 
 // ============================================================================
@@ -1333,10 +2374,10 @@ fn open_hud_windows(
     }
 
     // 悬浮控制条优先放在选区正下方；若靠近屏幕底部则放到选区正上方。
-    let bar_w = 292.0f32;
     let bar_h = 38.0f32;
     let disp_h = spec.display_bounds.size.height.as_f32();
     let disp_w = spec.display_bounds.size.width.as_f32();
+    let bar_w = 356.0f32.min((disp_w - 16.0).max(1.0));
     let bar_x = (x + (rw - bar_w) * 0.5).clamp(
         origin_x + 8.0,
         (origin_x + disp_w - bar_w - 8.0).max(origin_x + 8.0),
@@ -1374,7 +2415,7 @@ fn open_hud_windows(
     }
 }
 
-/// 录制中的悬浮控制条（计时器 + 暂停/继续 + 停止保存）。
+/// 录制中的悬浮控制条（计时器 + 取消 + 暂停/继续 + 停止保存）。
 struct RecordControlBar {
     elapsed_ms: Arc<AtomicU64>,
     focus_handle: FocusHandle,
@@ -1449,6 +2490,23 @@ impl Render for RecordControlBar {
                     .gap_2()
                     .child(
                         div()
+                            .id("rec-cancel-btn")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(p.card))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .text_xs()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(p.selected)))
+                            .on_click(cx.listener(|_, _, _, _| {
+                                cancel_active();
+                            }))
+                            .child(tr("rec.cancel")),
+                    )
+                    .child(
+                        div()
                             .id("rec-pause-btn")
                             .px_2()
                             .py_1()
@@ -1490,6 +2548,30 @@ mod tests {
     //! 录屏选区几何换算单测：比例锁定、标准尺寸适配与偶数对齐边界。
 
     use super::*;
+
+    /// 取消必须同时置位停止与丢弃标记，避免编码继续写出成品。
+    #[test]
+    fn cancel_active_marks_session_cancelled_and_stopped() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = active_slot().lock().expect("获取录屏会话锁");
+            *guard = Some(ActiveSession {
+                stop_flag: stop.clone(),
+                paused_flag: Arc::new(AtomicBool::new(false)),
+                cancel_flag: cancel.clone(),
+                hud_windows: Arc::new(Mutex::new(Vec::new())),
+                border_window: Arc::new(Mutex::new(None)),
+            });
+        }
+
+        assert!(cancel_active());
+        assert!(stop.load(Ordering::SeqCst));
+        assert!(cancel.load(Ordering::SeqCst));
+
+        let mut guard = active_slot().lock().expect("获取录屏会话锁");
+        *guard = None;
+    }
 
     /// 比例预设：中心近似保持、不超出屏幕边界、宽高符合目标比。
     #[test]

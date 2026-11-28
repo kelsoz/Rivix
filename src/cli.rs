@@ -1,37 +1,81 @@
-//! 命令行截图模块：无界面全屏 / 区域截图，直存 PNG 后退出。
+//! 命令行截图与录屏模块：无界面全屏 / 区域截图直存 PNG，或按窗口 / 进程 / 区域录屏后退出。
 //!
-//! 不带参数启动图形界面（托盘常驻）；带截图参数时不进 rgpui 事件循环，
-//! 直接经 Windows GDI 同步截取虚拟屏幕全屏（`--region` 再裁剪），保存后打印路径退出。
+//! 不带参数启动图形界面（托盘常驻）；带截图参数时经 Windows GDI 同步截图，
+//! 带 `record` 子命令时经 WGC 采集 BGRA 帧并交给 FFmpeg 编码。
 //! 参数解析只用标准库（不引入 clap 等新依赖），像素操作复用 `image` 依赖。
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use image::RgbaImage;
 
+use crate::record::{CliRecordRequest, CliRecordTarget, RecordFormat, run_cli_recording};
+
 /// 命令行帮助文案（`--help` 与参数错误时展示）。
-const HELP: &str = "Rivix 望川 · 命令行截图\n\
+const HELP: &str = "Rivix 望川 · 命令行截图 / 录屏\n\
     \n\
     用法：\n\
     \x20 rivix                              启动图形界面（托盘常驻）\n\
     \x20 rivix -f [--output 路径] [--copy]             截取全屏\n\
     \x20 rivix -r x,y,w,h [--output 路径] [--copy]     截取指定区域\n\
+    \x20 rivix record [目标] --duration 秒 [选项]      录制屏幕\n\
     \x20 rivix -h | --help                  显示本帮助\n\
     \x20 rivix -V | --version               显示版本\n\
     \n\
     说明：\n\
-    \x20 - 未指定 --output 时，保存到与图形界面共用的默认目录，文件名 rivix-<毫秒>.png。\n\
-    \x20 - --output 可为文件或已存在的目录（目录则自动补文件名）；无扩展名时补 .png。\n\
-    \x20 - 坐标为虚拟屏幕物理像素（多显示器取并集），如 100,200,800,600。\n\
-    \x20 - --copy 把保存的文件再复制到剪贴板（Windows）。\n";
+    \x20 - 未指定 --output 时，保存到与图形界面共用的默认目录，文件名 rivix-<毫秒>.<扩展名>。\n\
+    \x20 - --output 可为文件或已存在的目录（目录则自动补文件名）；无扩展名时自动补。\n\
+    \x20 - 截图坐标为虚拟屏幕物理像素（多显示器取并集），如 100,200,800,600。\n\
+    \x20 - --copy 把保存的文件再复制到剪贴板（Windows）。\n\
+    \x20 - 录屏详细参数见 rivix record --help。\n";
+
+/// 录屏子命令帮助文案。
+const RECORD_HELP: &str = "Rivix 望川 · 命令行录屏\n\
+    \n\
+    用法：\n\
+    \x20 rivix record --window 标题或HWND --duration 秒 [选项]\n\
+    \x20 rivix record --process PID或进程名 --duration 秒 [选项]\n\
+    \x20 rivix record -r x,y,w,h --duration 秒 [选项]\n\
+    \n\
+    目标（三选一，必填）：\n\
+    \x20 -w, --window <标题|HWND>    按窗口标题或完整 HWND 捕获真实窗口\n\
+    \x20 -p, --process <PID|进程名>  选择该进程面积最大的可见窗口\n\
+    \x20 -r, --region <x,y,w,h>      捕获单显示器物理像素区域，支持负坐标\n\
+    \n\
+    参数：\n\
+    \x20 -t, --duration <秒>         录制时长，必填且大于 0\n\
+    \x20 -F, --format <mp4|gif>      输出格式，默认 mp4\n\
+    \x20 -b, --bitrate <Mbps>        MP4 平均视频码率，默认 8（GIF 不适用）\n\
+    \x20     --fps <1..60>           帧率，默认 30\n\
+    \x20 -o, --output <文件|目录>     输出路径，默认使用截图保存目录\n\
+    \x20     --copy                  保存后复制文件到剪贴板（Windows）\n\
+    \x20 -h, --help                  显示本帮助\n\
+    \n\
+    说明：\n\
+    \x20 - 标题先精确匹配再子串匹配；多个结果取面积最大窗口。\n\
+    \x20 - 区域部分越界会裁剪；跨多个显示器会报错。\n\
+    \x20 - CLI 录屏仅视频，不录入鼠标或音频；MP4 使用 H.264 软件编码。\n\
+    \x20 - 输出文件已存在时拒绝覆盖；录制中改变窗口尺寸会停止并保留已录片段。\n";
 
 /// 命令行动具体作（参数解析结果）。
 enum CliAction {
     /// 打印帮助。
     Help,
+    /// 打印录屏帮助。
+    RecordHelp,
     /// 打印版本。
     Version,
     /// 执行截图并保存。
     Capture(CaptureRequest),
+    /// 执行录屏并保存。
+    Record {
+        /// 录屏请求。
+        request: CliRecordRequest,
+        /// 保存后是否复制文件到剪贴板。
+        copy: bool,
+    },
 }
 
 /// 一次命令行截图请求。
@@ -57,20 +101,24 @@ struct Region {
     h: u32,
 }
 
-/// 是否为命令行调用：带任意参数即走 CLI（截图后退出），无参数进图形界面。
+/// 是否为命令行调用：带任意参数即走 CLI（截图 / 录屏后退出），无参数进图形界面。
 pub fn is_cli_invocation() -> bool {
     std::env::args().len() > 1
 }
 
-/// 命令行入口：挂接父控制台 → 解析参数 → 执行截图，返回进程退出码。
+/// 命令行入口：挂接父控制台 → 解析参数 → 执行截图或录屏，返回进程退出码。
 ///
-/// 退出码：0 成功，1 参数错误，2 截图 / 保存失败。
+/// 退出码：0 成功，1 参数错误，2 截图 / 录屏 / 保存失败。
 pub fn run_cli() -> i32 {
     attach_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         Ok(CliAction::Help) => {
             print!("{HELP}");
+            0
+        }
+        Ok(CliAction::RecordHelp) => {
+            print!("{RECORD_HELP}");
             0
         }
         Ok(CliAction::Version) => {
@@ -87,6 +135,16 @@ pub fn run_cli() -> i32 {
                 2
             }
         },
+        Ok(CliAction::Record { request, copy }) => match execute_record(&request, copy) {
+            Ok(path) => {
+                println!("已保存：{}", path.display());
+                0
+            }
+            Err(error) => {
+                eprintln!("录屏失败：{error}");
+                2
+            }
+        },
         Err(error) => {
             eprintln!("参数错误：{error}\n\n{HELP}");
             1
@@ -96,6 +154,14 @@ pub fn run_cli() -> i32 {
 
 /// 解析命令行参数（纯函数，无副作用，便于单测）。
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    if args.first().is_some_and(|arg| arg == "record") {
+        return parse_record_args(&args[1..]);
+    }
+    parse_capture_args(args)
+}
+
+/// 解析原有截图参数，保持 `-f` / `-r` 行为不变。
+fn parse_capture_args(args: &[String]) -> Result<CliAction, String> {
     let mut fullscreen = false;
     let mut region: Option<Region> = None;
     let mut output: Option<PathBuf> = None;
@@ -145,6 +211,134 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }))
 }
 
+/// 解析录屏子命令：目标三选一，时长必填，其余参数使用最小默认值。
+fn parse_record_args(args: &[String]) -> Result<CliAction, String> {
+    let mut target: Option<CliRecordTarget> = None;
+    let mut duration = None;
+    let mut format = RecordFormat::Mp4;
+    let mut bitrate_mbps = None;
+    let mut fps = 30;
+    let mut output = None;
+    let mut copy = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => return Ok(CliAction::RecordHelp),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            "-w" | "--window" => {
+                let value = next_arg(args, &mut index, "--window")?;
+                if value.trim().is_empty() {
+                    return Err("--window 不能为空".to_string());
+                }
+                set_record_target(&mut target, CliRecordTarget::Window(value.to_string()))?;
+            }
+            "-p" | "--process" => {
+                let value = next_arg(args, &mut index, "--process")?;
+                if value.trim().is_empty() {
+                    return Err("--process 不能为空".to_string());
+                }
+                set_record_target(&mut target, CliRecordTarget::Process(value.to_string()))?;
+            }
+            "-r" | "--region" => {
+                let value = next_arg(args, &mut index, "--region")?;
+                let region = parse_region(value)?;
+                set_record_target(
+                    &mut target,
+                    CliRecordTarget::Region {
+                        x: region.x,
+                        y: region.y,
+                        w: region.w,
+                        h: region.h,
+                    },
+                )?;
+            }
+            "-t" | "--duration" => {
+                let value = next_arg(args, &mut index, "--duration")?;
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("--duration 必须为整数秒：{value}"))?;
+                if seconds == 0 {
+                    return Err("--duration 必须大于 0".to_string());
+                }
+                duration = Some(Duration::from_secs(seconds));
+            }
+            "-F" | "--format" => {
+                let value = next_arg(args, &mut index, "--format")?;
+                format = match value.to_ascii_lowercase().as_str() {
+                    "mp4" => RecordFormat::Mp4,
+                    "gif" => RecordFormat::Gif,
+                    _ => return Err(format!("--format 仅支持 mp4 或 gif：{value}")),
+                };
+            }
+            "-b" | "--bitrate" => {
+                let value = next_arg(args, &mut index, "--bitrate")?;
+                let mbps = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--bitrate 必须为正整数 Mbps：{value}"))?;
+                if mbps == 0 {
+                    return Err("--bitrate 必须大于 0".to_string());
+                }
+                bitrate_mbps = Some(mbps);
+            }
+            "--fps" => {
+                let value = next_arg(args, &mut index, "--fps")?;
+                fps = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--fps 必须为整数：{value}"))?;
+                if !(1..=60).contains(&fps) {
+                    return Err("--fps 必须在 1..=60 之间".to_string());
+                }
+            }
+            "-o" | "--output" => {
+                let value = next_arg(args, &mut index, "--output")?;
+                if value.is_empty() {
+                    return Err("--output 不能为空".to_string());
+                }
+                output = Some(PathBuf::from(value));
+            }
+            "--copy" => copy = true,
+            unknown => return Err(format!("未知录屏参数：{unknown}")),
+        }
+        index += 1;
+    }
+    let target = target.ok_or_else(|| "请指定 --window、--process 或 --region 之一".to_string())?;
+    let duration = duration.ok_or_else(|| "请指定 --duration 秒".to_string())?;
+    if format == RecordFormat::Gif && bitrate_mbps.is_some() {
+        return Err("GIF 不支持 --bitrate，请仅在 MP4 时使用".to_string());
+    }
+    Ok(CliAction::Record {
+        request: CliRecordRequest {
+            target,
+            duration,
+            format,
+            bitrate_mbps: bitrate_mbps.unwrap_or(8),
+            fps,
+            output,
+        },
+        copy,
+    })
+}
+
+/// 读取当前选项的值并推进游标；统一处理缺值与空参数。
+fn next_arg<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&'a str, String> {
+    *index += 1;
+    args.get(*index)
+        .map(String::as_str)
+        .ok_or_else(|| format!("{flag} 缺少参数值"))
+}
+
+/// 设置唯一录屏目标，重复或冲突目标直接报错。
+fn set_record_target(
+    slot: &mut Option<CliRecordTarget>,
+    target: CliRecordTarget,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("--window、--process、--region 只能指定一个".to_string());
+    }
+    *slot = Some(target);
+    Ok(())
+}
+
 /// 解析 `x,y,w,h`（如 `100,200,800,600`，物理像素，宽高必须为正）。
 fn parse_region(spec: &str) -> Result<Region, String> {
     let parts: Vec<&str> = spec.split(',').collect();
@@ -188,6 +382,15 @@ fn execute_capture(request: &CaptureRequest) -> Result<PathBuf, String> {
         if let Err(error) = crate::export::copy_file_to_clipboard(&path) {
             eprintln!("警告：复制到剪贴板失败：{error}");
         }
+    }
+    Ok(path)
+}
+
+/// 执行录屏；复制失败不影响已落盘视频，只告警。
+fn execute_record(request: &CliRecordRequest, copy: bool) -> Result<PathBuf, String> {
+    let path = run_cli_recording(request)?;
+    if copy && let Err(error) = crate::export::copy_file_to_clipboard(&path) {
+        eprintln!("警告：复制到剪贴板失败：{error}");
     }
     Ok(path)
 }
@@ -448,6 +651,185 @@ mod tests {
             Ok(CliAction::Version)
         ));
         assert!(matches!(parse_args(&args(&["-V"])), Ok(CliAction::Version)));
+    }
+
+    /// 录屏默认值：窗口 + 必填时长即可，MP4 / 8 Mbps / 30fps / 默认目录。
+    #[test]
+    fn record_defaults() {
+        let action = parse_args(&args(&[
+            "record",
+            "--window",
+            "Untitled - Notepad",
+            "--duration",
+            "2",
+        ]))
+        .expect("应解析成功");
+        let (request, copy) = assert_record(action);
+        assert_eq!(
+            request.target,
+            CliRecordTarget::Window("Untitled - Notepad".to_string())
+        );
+        assert_eq!(request.duration, Duration::from_secs(2));
+        assert_eq!(request.format, RecordFormat::Mp4);
+        assert_eq!(request.bitrate_mbps, 8);
+        assert_eq!(request.fps, 30);
+        assert!(request.output.is_none());
+        assert!(!copy);
+    }
+
+    /// 区域录屏支持负坐标、完整参数与复制。
+    #[test]
+    fn record_region_with_all_options() {
+        let action = parse_args(&args(&[
+            "record",
+            "-r",
+            "-10,-20,640,480",
+            "-t",
+            "3",
+            "-F",
+            "mp4",
+            "-b",
+            "12",
+            "--fps",
+            "60",
+            "-o",
+            "out/clip",
+            "--copy",
+        ]))
+        .expect("应解析成功");
+        let (request, copy) = assert_record(action);
+        assert_eq!(
+            request.target,
+            CliRecordTarget::Region {
+                x: -10,
+                y: -20,
+                w: 640,
+                h: 480,
+            }
+        );
+        assert_eq!(request.duration, Duration::from_secs(3));
+        assert_eq!(request.bitrate_mbps, 12);
+        assert_eq!(request.fps, 60);
+        assert_eq!(request.output, Some(PathBuf::from("out/clip")));
+        assert!(copy);
+    }
+
+    /// 进程录屏可选择 GIF；GIF 保留默认码率字段但不允许显式 --bitrate。
+    #[test]
+    fn record_process_gif() {
+        let action = parse_args(&args(&[
+            "record",
+            "--process",
+            "Code.exe",
+            "--duration",
+            "1",
+            "--format",
+            "gif",
+            "-o",
+            "clip.gif",
+        ]))
+        .expect("应解析成功");
+        let (request, copy) = assert_record(action);
+        assert_eq!(
+            request.target,
+            CliRecordTarget::Process("Code.exe".to_string())
+        );
+        assert_eq!(request.format, RecordFormat::Gif);
+        assert_eq!(request.bitrate_mbps, 8);
+        assert!(!copy);
+    }
+
+    /// 录屏互斥、必填项与边界值均在解析阶段拒绝。
+    #[test]
+    fn record_rejects_invalid_arguments() {
+        let invalid: &[&[&str]] = &[
+            &["record", "--window", "Notepad"],
+            &["record", "--duration", "1"],
+            &["record", "--window", "Notepad", "--duration", "0"],
+            &[
+                "record",
+                "--window",
+                "Notepad",
+                "--duration",
+                "1",
+                "--fps",
+                "0",
+            ],
+            &[
+                "record",
+                "--window",
+                "Notepad",
+                "--duration",
+                "1",
+                "--fps",
+                "61",
+            ],
+            &[
+                "record",
+                "--window",
+                "Notepad",
+                "--duration",
+                "1",
+                "--bitrate",
+                "0",
+            ],
+            &[
+                "record",
+                "--window",
+                "Notepad",
+                "--duration",
+                "1",
+                "--format",
+                "webm",
+            ],
+            &[
+                "record",
+                "--window",
+                "Notepad",
+                "--duration",
+                "1",
+                "--format",
+                "gif",
+                "--bitrate",
+                "8",
+            ],
+            &[
+                "record",
+                "--window",
+                "Notepad",
+                "--region",
+                "0,0,10,10",
+                "--duration",
+                "1",
+            ],
+            &["record", "--window"],
+            &["record", "--window", "Notepad", "--duration", "1", "--wat"],
+            &["record", "--window", "Notepad", "--duration", "1", "-o"],
+        ];
+        for case in invalid {
+            assert!(parse_args(&args(case)).is_err(), "用例应拒绝：{case:?}");
+        }
+    }
+
+    /// 录屏帮助与版本独立于必填目标 / 时长。
+    #[test]
+    fn record_help_and_version() {
+        assert!(matches!(
+            parse_args(&args(&["record", "--help"])),
+            Ok(CliAction::RecordHelp)
+        ));
+        assert!(matches!(
+            parse_args(&args(&["record", "--version"])),
+            Ok(CliAction::Version)
+        ));
+    }
+
+    /// 断言解析结果为录屏动作，并拆出请求与复制开关。
+    fn assert_record(action: CliAction) -> (CliRecordRequest, bool) {
+        match action {
+            CliAction::Record { request, copy } => (request, copy),
+            _ => panic!("应为录屏动作"),
+        }
     }
 
     /// 区域格式用例：合法解析，非法（缺段 / 非数字 / 非正宽高）报错。

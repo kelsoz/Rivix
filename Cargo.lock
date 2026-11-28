@@ -4699,10 +4699,12 @@ dependencies = [
  "raw-window-handle",
  "rgpui",
  "rgpui-platform",
+ "scap-rs",
  "serde",
  "serde_json",
  "url",
  "windows 0.62.2",
+ "windows-capture",
 ]
 
 [[package]]
